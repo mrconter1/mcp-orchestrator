@@ -386,6 +386,32 @@ def mcp_install(
 
 
 @server.tool()
+def mcp_uninstall(
+    name: str,
+    delete_files: bool = False,
+    force: bool = False,
+    restart_sessions: bool = True,
+) -> dict[str, Any]:
+    """Uninstall a managed server: stop it, unregister it, drop it from the config.
+
+    DESTRUCTIVE with delete_files=true, which also deletes the server's
+    directory. That is refused when the directory holds work that exists
+    nowhere else (uncommitted changes, unpushed commits, or no upstream at
+    all); pass force=true to override, which throws that work away.
+
+    Without delete_files the code stays on disk and only the management and
+    registration are removed, which is the reversible option.
+    """
+    try:
+        result = catalogue.uninstall(name, delete_files, force)
+    except (catalogue.InstallError, OSError) as exc:
+        return _err(str(exc))
+    if result.get("unregistered"):
+        result.update(_finish_install(f"uninstalled MCP server {name!r}", restart_sessions))
+    return _ok(**result)
+
+
+@server.tool()
 def mcp_stats(name: str | None = None) -> dict[str, Any]:
     """Statistics for the managed servers: uptime, availability, crashes, resources.
 

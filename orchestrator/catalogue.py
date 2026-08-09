@@ -12,7 +12,10 @@ ordinary Python one: a package directory containing ``server.py``, and a
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -127,6 +130,94 @@ def _clone(url: str, target: Path) -> dict[str, Any]:
     if result.returncode != 0:
         raise InstallError(f"git clone failed: {(result.stderr or result.stdout).strip()}")
     return {"cloned": True, "directory": str(target)}
+
+
+def unsaved_work(directory: Path) -> list[str]:
+    """Reasons deleting this directory would destroy something unrecoverable.
+
+    A tracked, clean, pushed clone can be deleted freely: it exists elsewhere.
+    Anything else is somebody's work, and "uninstall" is not a licence to throw
+    it away.
+    """
+    if not (directory / ".git").exists():
+        return ["not a git repository, so nothing is recoverable after deletion"]
+
+    reasons = []
+    status = subprocess.run(  # noqa: S603
+        ["git", "-C", str(directory), "status", "--porcelain"],
+        capture_output=True, text=True, check=False,
+    )
+    if status.returncode == 0 and status.stdout.strip():
+        count = len(status.stdout.strip().splitlines())
+        reasons.append(f"{count} uncommitted change(s)")
+
+    # Commits that exist only here. @{u} fails when there is no upstream, which
+    # is itself the strongest reason not to delete: nothing has ever left.
+    ahead = subprocess.run(  # noqa: S603
+        ["git", "-C", str(directory), "rev-list", "--count", "@{u}..HEAD"],
+        capture_output=True, text=True, check=False,
+    )
+    if ahead.returncode != 0:
+        reasons.append("no upstream branch, so no copy of it exists anywhere else")
+    elif ahead.stdout.strip() not in ("", "0"):
+        reasons.append(f"{ahead.stdout.strip()} unpushed commit(s)")
+    return reasons
+
+
+def uninstall(
+    name: str,
+    delete_files: bool = False,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Stop a server, unregister it, and optionally delete its directory."""
+    spec = config.get(name)
+    if spec is None:
+        raise InstallError(f"no server named {name!r} is managed")
+
+    result: dict[str, Any] = {"name": name, "directory": spec.cwd}
+    try:
+        result["stopped"] = supervise.stop(spec)["was_running"]
+    except supervise.SuperviseError as exc:
+        result["stopped"] = f"error: {exc}"
+
+    result["unregistered"] = claude_cli.unregister(name)
+    result["removed_from_config"] = config.remove(name)
+
+    if delete_files:
+        result.update(_delete_directory(spec.cwd, force))
+    else:
+        result["files"] = "left in place; pass delete_files to remove them"
+    return result
+
+
+def _delete_directory(cwd: str | None, force: bool) -> dict[str, Any]:
+    if not cwd:
+        return {"files": "no directory recorded for this server"}
+    directory = Path(cwd)
+    if not directory.exists():
+        return {"files": f"{directory} does not exist"}
+
+    blockers = unsaved_work(directory)
+    if blockers and not force:
+        return {
+            "files": "kept",
+            "refused": (
+                f"{directory} has work that exists nowhere else ("
+                f"{'; '.join(blockers)}). Pass force to delete it anyway."
+            ),
+        }
+
+    # Git keeps its object store read-only, so a plain delete fails part way
+    # through and leaves a half-removed directory behind.
+    def _writable(func: Any, path: str, _exc: Any) -> None:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+
+    try:
+        shutil.rmtree(directory, onexc=_writable)
+    except OSError as exc:
+        return {"files": "partly deleted", "error": str(exc)}
+    return {"files": f"deleted {directory}", "forced": bool(blockers and force)}
 
 
 def install(
