@@ -55,6 +55,7 @@ class ServerSpec:
     env: dict[str, str] = field(default_factory=dict)
     autostart: bool = True
     enabled: bool = True
+    auto_restart: bool = True
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -75,6 +76,7 @@ class ServerSpec:
                 "env": dict(self.env),
                 "autostart": self.autostart,
                 "enabled": self.enabled,
+                "auto_restart": self.auto_restart,
             }
         )
         return data
@@ -92,7 +94,10 @@ class ServerSpec:
         }
 
 
-_KNOWN = {"name", "command", "cwd", "port", "path", "env", "autostart", "enabled"}
+_KNOWN = {
+    "name", "command", "cwd", "port", "path", "env",
+    "autostart", "enabled", "auto_restart",
+}
 
 
 def _as_command(value: Any, name: str) -> list[str]:
@@ -131,6 +136,7 @@ def spec_from_dict(data: dict[str, Any]) -> ServerSpec:
         env={str(k): str(v) for k, v in env.items()},
         autostart=bool(data.get("autostart", True)),
         enabled=bool(data.get("enabled", True)),
+        auto_restart=bool(data.get("auto_restart", True)),
         extra={k: v for k, v in data.items() if k not in _KNOWN},
     )
 

@@ -21,9 +21,94 @@ from orchestrator import config, paths, supervise
 
 SAMPLE_SECONDS = 10
 
+# Backoff between restart attempts. Fixed ladder rather than a formula: five
+# seconds is long enough for a port to clear, and by the fifth attempt a server
+# that is still failing is not going to be fixed by trying harder.
+BACKOFF_SECONDS = (5, 15, 45, 120, 300)
+MAX_ATTEMPTS = len(BACKOFF_SECONDS)
+
+# How long a server must stay up before its failures are forgiven. Without
+# this, a server that crashes once a day would eventually exhaust its attempts
+# and stay down, having been healthy for weeks in between.
+STABLE_SECONDS = 120
+
+# Set by the tray so crash-loop warnings can reach the user. Left as None when
+# running headless, where the log is the only place to say it.
+notifier: Any = None
+
 
 def _now() -> str:
     return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def _notify(title: str, message: str) -> None:
+    """Tell the user, by whatever channel exists."""
+    try:
+        from orchestrator import server as server_module
+
+        server_module.log(f"{title}: {message}")
+    except Exception:  # noqa: BLE001
+        pass
+    if notifier is not None:
+        try:
+            notifier(message, title)
+        except Exception:  # noqa: BLE001 -- a failed toast must not stop supervision
+            pass
+
+
+def _recover(spec: Any, state: dict[str, Any], entry: dict[str, Any], now: float) -> dict[str, Any]:
+    """Restart a server that died, or give up loudly.
+
+    Only ``crashed`` and ``unhealthy`` are recoverable. ``stopped`` means
+    somebody stopped it on purpose and restarting it would be the orchestrator
+    arguing with the user; ``external`` is not ours to touch.
+    """
+    recoverable = state["state"] in ("crashed", "unhealthy")
+
+    if not recoverable:
+        # A sustained healthy run wipes the slate, including a previous give-up.
+        if state["state"] == "running" and (state.get("uptime_seconds") or 0) >= STABLE_SECONDS:
+            if entry.get("restart_attempts") or entry.get("gave_up"):
+                entry["restart_attempts"] = 0
+                entry["gave_up"] = False
+                entry["next_retry_epoch"] = None
+        return entry
+
+    if not (spec.enabled and spec.auto_restart) or entry.get("gave_up"):
+        return entry
+
+    attempts = int(entry.get("restart_attempts", 0))
+    next_retry = entry.get("next_retry_epoch")
+    if next_retry is not None and now < float(next_retry):
+        return entry  # still serving the backoff
+
+    if attempts >= MAX_ATTEMPTS:
+        entry["gave_up"] = True
+        entry["next_retry_epoch"] = None
+        _notify(
+            "MCP server keeps crashing",
+            f"{spec.name} failed {attempts} restarts and will not be retried. "
+            f"See mcp_logs('{spec.name}').",
+        )
+        return entry
+
+    entry["restart_attempts"] = attempts + 1
+    entry["next_retry_epoch"] = now + BACKOFF_SECONDS[min(attempts, MAX_ATTEMPTS - 1)]
+    entry["last_auto_restart"] = _now()
+    try:
+        result = supervise.restart(spec)
+        ok = result.get("state") == "running"
+    except supervise.SuperviseError as exc:
+        ok = False
+        entry["last_error"] = str(exc)
+
+    if ok:
+        _notify(
+            "MCP server restarted",
+            f"{spec.name} had crashed and was restarted automatically "
+            f"(attempt {attempts + 1}).",
+        )
+    return entry
 
 
 def sample() -> list[dict[str, Any]]:
@@ -33,6 +118,7 @@ def sample() -> list[dict[str, Any]]:
     data = supervise.runtime_state()
     now = time.time()
 
+    by_name = {spec.name: spec for spec in specs}
     for state in states:
         entry = dict(data.get(state["name"], {}))
         up = state["state"] in ("running", "external")
@@ -55,9 +141,23 @@ def sample() -> list[dict[str, Any]]:
         if up:
             entry["last_seen_up"] = _now()
 
+        spec = by_name.get(state["name"])
+        if spec is not None:
+            entry = _recover(spec, state, entry, now)
+
         data[state["name"]] = entry
 
-    supervise.save_runtime_state(data)
+    # _recover restarts through supervise, which writes this same file. Merge
+    # its updates rather than clobbering them with our older snapshot.
+    fresh = supervise.runtime_state()
+    for name, entry in data.items():
+        merged = dict(fresh.get(name, {}))
+        merged.update(entry)
+        for key in ("pid", "create_time", "started", "started_epoch", "starts", "crashed_at"):
+            if name in fresh:
+                merged[key] = fresh[name].get(key)
+        fresh[name] = merged
+    supervise.save_runtime_state(fresh)
     return states
 
 
@@ -99,6 +199,10 @@ def stats() -> dict[str, Any]:
                 "last_exit": entry.get("last_exit"),
                 "autostart": spec.autostart,
                 "enabled": spec.enabled,
+                "auto_restart": spec.auto_restart,
+                "restart_attempts": entry.get("restart_attempts", 0),
+                "gave_up": bool(entry.get("gave_up")),
+                "last_auto_restart": entry.get("last_auto_restart"),
             }
         )
 
@@ -108,6 +212,7 @@ def stats() -> dict[str, Any]:
         "up": sum(1 for s in servers if s["state"] in ("running", "external")),
         "problems": [s["name"] for s in servers if s["state"] in ("crashed", "unhealthy")],
         "total_crashes": sum(int(s["crashes"] or 0) for s in servers),
+        "given_up": [s["name"] for s in servers if s["gave_up"]],
         "sample_interval_seconds": SAMPLE_SECONDS,
     }
 

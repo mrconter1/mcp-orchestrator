@@ -23,7 +23,7 @@ from typing import Any, Callable
 import pystray
 from PIL import Image, ImageDraw
 
-from orchestrator import config, paths, restart, supervise
+from orchestrator import config, monitor, paths, restart, supervise
 
 REFRESH_SECONDS = 5
 SIZE = 64
@@ -212,7 +212,17 @@ class Tray:
     def _setup(self, icon: Any) -> None:
         """Called by pystray once the icon exists; before this it is not shown."""
         icon.visible = True
+        # Give the supervisor a way to reach the user. A server quietly
+        # exhausting its restarts is worth interrupting for; the tray colour
+        # alone only helps someone already looking at the tray.
+        monitor.notifier = self._notify
         self.refresh()
+
+    def _notify(self, message: str, title: str) -> None:
+        try:
+            self.icon.notify(message, title)
+        except Exception:  # noqa: BLE001 -- notifications are best effort
+            pass
 
     def run(self) -> None:
         """Blocks. pystray's Windows backend must own the main thread."""
