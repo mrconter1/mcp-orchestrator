@@ -1,11 +1,11 @@
 # mcp-orchestrator
 
-Manages the local MCP servers on this machine. Starts them hidden at logon,
-tracks whether they are actually up, and restarts Claude Code sessions when the
-set of servers changes.
+Manages the local MCP servers on a Windows machine. Installs them, starts them
+hidden at logon, restarts them when they crash, and shows the lot in a tray
+icon.
 
-One hidden process with a tray icon, started by a Scheduled Task at logon,
-exposing itself as an HTTP MCP server on `http://127.0.0.1:8768/mcp`.
+One hidden process, started by a Scheduled Task, serving MCP on
+`http://127.0.0.1:8768/mcp`.
 
 ## Install
 
@@ -16,153 +16,77 @@ python -m venv .venv
 claude mcp add --transport http --scope user orchestrator http://127.0.0.1:8768/mcp
 ```
 
-`install.ps1` registers the Scheduled Task (at logon, as you, no admin) and adds
-a SessionStart and a Stop hook to `~/.claude/settings.json`. Hooks apply to
-sessions started afterwards. Undo with `.\install\uninstall.ps1`.
+Registers the Scheduled Task and adds two Claude Code hooks. Undo with
+`.\install\uninstall.ps1`.
 
 ## Installable servers
 
-These install with one call. `mcp_catalogue` lists them with their current
-status, `mcp_install("<name>")` sets one up: clone, venv, port, registration,
-running process.
+```
+mcp_install("queue")
+```
 
 | Server | Repository | What it does |
 | --- | --- | --- |
-| `session` | [session-control-mcp](https://github.com/mrconter1/session-control-mcp) | Control Claude Code sessions: list, open, fork off a transcript, close, restart. Destructive tools, meant to prompt on every call. |
-| `queue` | [queue-mcp](https://github.com/mrconter1/queue-mcp) | A per-session task queue. Add work from another terminal without steering the running turn; Claude drains it one item at a time. |
+| `session` | [session-control-mcp](https://github.com/mrconter1/session-control-mcp) | List, open, fork, close and restart Claude Code sessions |
+| `queue` | [queue-mcp](https://github.com/mrconter1/queue-mcp) | A task queue you fill from another terminal |
 
-`mcp_install` also takes any git URL, or a local path for a private repo you
-already have. The layout it expects is the ordinary one: a package containing
-`server.py`, with `requirements.txt` beside it.
-
-A port is only useful if the server hears about it. Catalogue entries record
-the environment variable their server reads (`QUEUE_MCP_PORT` and so on). For
-other repositories, pass `port_env`. Without it, an install that would have to
-move off a taken port refuses rather than starting a server bound to the wrong
-one.
+`mcp_install` also takes any git URL, or a local path for a private repo. It
+expects the ordinary Python layout: a package containing `server.py`, with
+`requirements.txt` beside it.
 
 ## Tools
 
 | Tool | Purpose |
 | --- | --- |
-| `mcp_list` / `mcp_status` | every managed server with live state, or one in detail |
+| `mcp_list` / `mcp_status` / `mcp_stats` | what is running, and how it has behaved |
 | `mcp_start` / `mcp_stop` / `mcp_restart` | lifecycle |
+| `mcp_catalogue` / `mcp_install` / `mcp_uninstall` | install and remove servers |
+| `mcp_scaffold` | write a new server from a template |
+| `mcp_add` / `mcp_remove` | manage a server already on disk |
 | `mcp_autostart` / `mcp_enable` | start at logon, or park a server |
-| `mcp_logs` | the tail of a server's log |
-| `mcp_stats` | uptime, availability, crashes, memory, CPU |
-| `mcp_catalogue` / `mcp_install` | see what is installable, and install it |
-| `mcp_scaffold` | create a new server from a template |
-| `mcp_add` / `mcp_remove` | manage a server already on disk, or stop managing one |
-| `mcp_uninstall` | stop, unregister, and optionally delete the directory |
-| `sessions_list` | running Claude Code sessions and their transcript ids |
-| `sessions_restart_pending` / `sessions_restart` | restart sessions at their next stop, or one now |
-| `sessions_restart_status` / `sessions_restart_clear` | inspect or cancel |
-| `orchestrator_info` | health of the orchestrator itself |
+| `mcp_logs` | a hidden server's only voice |
+| `sessions_*` | list sessions, and restart them when the server set changes |
 
-## Server states
+## What it does about failure
 
-| State | Meaning |
-| --- | --- |
-| `running` | process alive and the port answers |
-| `starting` | started moments ago, port not up yet |
-| `unhealthy` | alive but not listening: crash loop or bad config |
-| `crashed` | we started it and it died on its own |
-| `external` | the port answers but the orchestrator did not start it |
-| `stopped` | not running, and nobody expected it to be |
+A hidden server has no window to die in, so the whole design is about not
+letting a dead one look like a missing tool.
 
-`crashed` is deliberately distinct from `stopped`. A hidden server has no window
-to die in, so this state is the only evidence you get.
+- **States distinguish causes.** `crashed` (died on its own) is not `stopped`
+  (somebody stopped it), and `unhealthy` (alive, not listening) is not either.
+  `external` means the port answers but the orchestrator did not start it, and
+  will not touch it.
+- **A start waits for the port** before reporting success. A pid proves
+  nothing.
+- **Crashes are restarted** on a 5, 15, 45, 120, 300 second ladder, then
+  abandoned with a notification. Two minutes of health clears the count.
+- **The tray colour is the summary.** Green up, amber starting or stopped, red
+  with an exclamation for trouble.
 
-A `crashed` or `unhealthy` server is restarted automatically on a backoff
-ladder of 5, 15, 45, 120 and 300 seconds. After five failures it is left alone
-and a notification says so, because a server still failing on the sixth attempt
-will not be fixed by a seventh. Two minutes of health clears the count. A
-`stopped` server is left stopped: somebody stopped it on purpose.
+## Sessions and the restart dance
 
-## Creating a server
+Claude Code attaches MCP servers at startup and never retries. **Adding or
+removing** a server is invisible to running sessions until they restart, so
+`mcp_install`, `mcp_scaffold`, `mcp_add` and `mcp_uninstall` ask them to.
+**Restarting** a server needs nothing; the client reconnects per call.
 
-```
-mcp_scaffold("weather")
-```
-
-Generates `~/Repos/weather-mcp`, builds a venv with the MCP SDK, allocates a
-free port, registers it with Claude Code, and starts it. The generated server
-has one working tool, so a successful call means the whole chain works and all
-that is left is writing real tools in `weather_mcp/server.py`.
-
-## When a session needs restarting
-
-Claude Code attaches MCP servers at process startup and never retries. So
-**adding or removing** a server is invisible to sessions already running until
-they restart. `mcp_add`, `mcp_scaffold` and `mcp_remove` request that restart by
-default.
-
-**Restarting** a server needs nothing: the HTTP client reconnects per call, so a
-running session keeps working across `mcp_restart`.
-
-The restart itself is decentralised. A change writes `pending-restart.json`;
-each session's Stop hook sees it at the end of a turn, when nothing is in
-flight, and restarts that session resuming the same transcript id, so history
-and the per-session queue survive. The marker is consumed per session and keyed
-by a uuid, so one session restarting does not cancel it for the others, and two
-changes in the same second stay distinct.
+The restart is decentralised. A change drops a marker, and each session's Stop
+hook acts on it at the end of a turn, when nothing is in flight, resuming the
+same transcript so history and queue survive.
 
 ## Files
 
-State lives in `~/.mcp-orchestrator`, outside the repo, because the hooks must
-find it without knowing where the repo was cloned.
-
-| File | Contents |
-| --- | --- |
-| `servers.json` | the configured servers, hand-editable |
-| `running.json` | pids and statistics |
-| `sessions.json` | session registry, written by the SessionStart hook |
-| `pending-restart.json` | the restart marker, when set |
-| `restart-consumed.json` | which session handled which marker |
-| `logs/<name>.log` | each server's stdout and stderr |
-| `logs/orchestrator.log` | the orchestrator's own log |
-
-```json
-{
-  "name": "weather",
-  "command": ["C:/Users/you/Repos/weather-mcp/.venv/Scripts/python.exe", "-m", "weather_mcp.server"],
-  "cwd": "C:/Users/you/Repos/weather-mcp",
-  "port": 8769,
-  "path": "/mcp",
-  "env": {},
-  "autostart": true,
-  "enabled": true
-}
-```
-
-## Tray icon
-
-Green: everything up. Amber: something stopped or starting. Red with an
-exclamation: something crashed or is not listening. Grey: nothing managed.
-
-The menu is rebuilt each time it opens: start, stop and restart per server, its
-log, and a way to ask the sessions to restart. Quitting leaves servers running.
-
-## Troubleshooting
-
-| Symptom | Look at |
-| --- | --- |
-| orchestrator did not come up | `~/.mcp-orchestrator/logs/orchestrator.log`, written even with no console |
-| a server is `crashed` or `unhealthy` | `mcp_logs("<name>")` |
-| a server is `external` | something else holds that port; the orchestrator will not touch it |
-| a new tool is missing | the session has not restarted; check `sessions_restart_status` |
-| sessions listed as `unregistered` | they started before the SessionStart hook was installed |
+State lives in `~/.mcp-orchestrator`, outside this repo, because the hooks must
+find it without knowing where the repo was cloned: `servers.json` (hand
+editable), `running.json`, `sessions.json`, the restart markers, and `logs/`.
 
 ## Known gaps
 
-- The at-logon trigger is configured but has only ever been triggered manually.
-- The live session restart path (`wt.exe` spawn plus `--resume`) is unproven.
+- The at-logon trigger is configured but has only ever been fired manually.
+- The live session restart path (`wt.exe` plus `--resume`) is unproven.
 - `orchestrator.log` does not rotate; per-server logs rotate at 5 MB.
-- Windows only. The supervision, the tray and the installer all assume it.
+- Windows only, throughout.
 
-## Not a Windows Service
-
-Services run in session 0, isolated from the desktop, so a service could not
-show a tray icon or open a terminal tab. A Scheduled Task with an at-logon
-trigger runs as the user in their own desktop session, needs no admin, survives
-reboot, and has restart-on-failure built in.
+[DESIGN.md](DESIGN.md) has the reasoning, including why this is a Scheduled
+Task and not a Windows Service, and the Windows traps that cost a debugging
+round each.
