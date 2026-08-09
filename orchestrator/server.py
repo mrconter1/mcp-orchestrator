@@ -19,7 +19,16 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-from orchestrator import __version__, claude_cli, config, paths, supervise
+from orchestrator import (
+    __version__,
+    claude_cli,
+    config,
+    paths,
+    registry,
+    restart,
+    scaffold,
+    supervise,
+)
 from orchestrator.config import ServerSpec
 
 HOST = os.environ.get("MCP_ORCHESTRATOR_HOST", "127.0.0.1")
@@ -46,6 +55,32 @@ def _ok(**payload: Any) -> dict[str, Any]:
 
 def _err(message: str, **payload: Any) -> dict[str, Any]:
     return {"ok": False, "error": message, **payload}
+
+
+def _finish_install(reason: str, restart_sessions: bool) -> dict[str, Any]:
+    """The last step of any change to the server set.
+
+    Registering a server is not the end of installing it. Sessions already
+    running attached their MCP servers at startup and never retry, so without
+    this they keep the old tool list until the user happens to restart them --
+    and the change looks like it silently did nothing.
+    """
+    if not restart_sessions:
+        return {
+            "note": (
+                "Not requested. Running sessions will not see this change until they "
+                "restart; call sessions_restart_pending when ready."
+            )
+        }
+    restart.request(reason)
+    waiting = restart.status()["waiting"]
+    return {
+        "sessions_pending_restart": waiting,
+        "note": (
+            f"{len(waiting)} running session(s) will restart at the end of their next "
+            f"turn and resume the same transcript. Until then they cannot see this change."
+        ),
+    }
 
 
 def _require(name: str) -> ServerSpec:
@@ -183,6 +218,7 @@ def mcp_add(
     autostart: bool = True,
     register: bool = True,
     start: bool = True,
+    restart_sessions: bool = True,
 ) -> dict[str, Any]:
     """Put an existing local HTTP MCP server under orchestrator management.
 
@@ -191,7 +227,8 @@ def mcp_add(
     for example "C:/repo/.venv/Scripts/python.exe -m my_server.server".
 
     With register=true the server is also added to Claude Code's user config,
-    which only takes effect in sessions started afterwards.
+    and with restart_sessions=true every running session is asked to restart at
+    its next natural stop, which is what actually makes the new tools reachable.
     """
     if config.get(name) is not None:
         return _err(f"{name!r} is already managed; remove it first or pick another name")
@@ -220,18 +257,19 @@ def mcp_add(
     if register:
         try:
             result["registration"] = claude_cli.register(name, spec.url or "")
+            result.update(_finish_install(f"added MCP server {name!r}", restart_sessions))
         except claude_cli.ClaudeCliError as exc:
             result["registration"] = {"error": str(exc)}
-    result["note"] = (
-        "Registered with Claude Code, but running sessions attach MCP servers only at "
-        "startup. Call sessions_restart_pending to have every session pick it up at its "
-        "next natural stop."
-    )
     return _ok(**result)
 
 
 @server.tool()
-def mcp_remove(name: str, stop: bool = True, unregister: bool = True) -> dict[str, Any]:
+def mcp_remove(
+    name: str,
+    stop: bool = True,
+    unregister: bool = True,
+    restart_sessions: bool = True,
+) -> dict[str, Any]:
     """Stop managing a server: drop it from servers.json and from Claude Code's config.
 
     Deletes no files. The server's repository and logs are left alone.
@@ -248,8 +286,106 @@ def mcp_remove(name: str, stop: bool = True, unregister: bool = True) -> dict[st
             result["stopped"] = f"error: {exc}"
     if unregister:
         result["unregistered"] = claude_cli.unregister(name)
+        result.update(_finish_install(f"removed MCP server {name!r}", restart_sessions))
     result["removed_from_config"] = config.remove(name)
     return _ok(**result)
+
+
+@server.tool()
+def mcp_scaffold(
+    name: str,
+    directory: str | None = None,
+    port: int | None = None,
+    register: bool = True,
+    start: bool = True,
+    autostart: bool = True,
+    restart_sessions: bool = True,
+) -> dict[str, Any]:
+    """Create a brand new local HTTP MCP server and put it under management.
+
+    Generates a repo (default ~/Repos/<name>-mcp), builds a venv with the MCP
+    SDK, allocates a free port, registers the server with Claude Code and
+    starts it. The generated server already has one working tool, so a
+    successful call means the whole chain works and the only thing left is
+    writing real tools in the file named by "edit" in the result.
+
+    Takes a minute or so, most of it pip. The new tools are invisible to
+    sessions already running until they restart.
+    """
+    try:
+        result = scaffold.create(name, directory, port, register, start, autostart)
+    except (scaffold.ScaffoldError, supervise.SuperviseError, OSError) as exc:
+        return _err(str(exc))
+    if register and "error" not in result.get("registration", {}):
+        result.update(_finish_install(f"scaffolded MCP server {name!r}", restart_sessions))
+    result["next"] = f"Edit {result['edit']} to add tools, then mcp_restart({name!r})."
+    return _ok(**result)
+
+
+@server.tool()
+def sessions_list() -> dict[str, Any]:
+    """List the running Claude Code sessions, with pid and transcript session id.
+
+    Populated by a SessionStart hook, which is the only place both halves are
+    visible. "unregistered" lists live claude.exe processes with no entry: those
+    started before the hook was installed and cannot be restarted by session id
+    until they have started once with it in place.
+    """
+    sessions = registry.list_sessions()
+    unknown = registry.unregistered_sessions()
+    return _ok(
+        sessions=sessions,
+        count=len(sessions),
+        unregistered=unknown,
+        hook_installed=paths.sessions_file().exists(),
+    )
+
+
+@server.tool()
+def sessions_restart_pending(reason: str = "the MCP server set changed") -> dict[str, Any]:
+    """Ask every running session to restart at its next natural stop.
+
+    This is how a newly installed server actually reaches the sessions that are
+    already running: they attach MCP servers only at startup, so nothing short
+    of a restart makes a new server visible. Nothing is killed now. Each session
+    notices the marker at the end of its current turn, announces it, and comes
+    back resuming the same transcript, so its history and its queue survive.
+    """
+    marker = restart.request(reason)
+    state = restart.status()
+    return _ok(
+        marker=marker,
+        sessions_waiting=state["waiting"],
+        count=len(state["waiting"]),
+        note="Sessions restart at the end of their next turn, not immediately.",
+    )
+
+
+@server.tool()
+def sessions_restart(session_id: str, delay_ms: int = 3000) -> dict[str, Any]:
+    """Restart one session right now, resuming the same transcript.
+
+    DESTRUCTIVE and immediate: the replacement opens in a new tab and the old
+    process is killed a few seconds later, losing any turn still in flight.
+    Prefer sessions_restart_pending, which waits for a natural stop. Use this
+    only when the user asks for a specific session to be restarted now.
+    """
+    try:
+        return _ok(**restart.restart_session(session_id, delay_ms=delay_ms))
+    except (LookupError, OSError) as exc:
+        return _err(str(exc))
+
+
+@server.tool()
+def sessions_restart_status() -> dict[str, Any]:
+    """Whether a restart is pending, and which sessions have yet to act on it."""
+    return _ok(**restart.status())
+
+
+@server.tool()
+def sessions_restart_clear() -> dict[str, Any]:
+    """Cancel a pending restart. Sessions that already restarted stay restarted."""
+    return _ok(cleared=restart.clear())
 
 
 @server.tool()

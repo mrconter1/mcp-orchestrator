@@ -1,0 +1,5 @@
+# Start __NAME__ in the foreground. Ctrl+C to stop.
+# The orchestrator normally runs this hidden; use this when you need to see it.
+$ErrorActionPreference = "Stop"
+Set-Location $PSScriptRoot
+& "$PSScriptRoot\.venv\Scripts\python.exe" -m __PACKAGE__.server
