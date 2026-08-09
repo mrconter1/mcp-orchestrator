@@ -20,13 +20,44 @@ claude mcp add --transport http --scope user orchestrator http://127.0.0.1:8768/
 a SessionStart and a Stop hook to `~/.claude/settings.json`. Hooks apply to
 sessions started afterwards. Undo with `.\install\uninstall.ps1`.
 
+## Installable servers
+
+These install with one call. `mcp_catalogue` lists them with their current
+status, `mcp_install("<name>")` sets one up: clone, venv, port, registration,
+running process.
+
+| Server | Repository | What it does |
+| --- | --- | --- |
+| `session` | [session-control-mcp](https://github.com/mrconter1/session-control-mcp) | Control Claude Code sessions: list, open, fork off a transcript, close, restart. Destructive tools, meant to prompt on every call. |
+| `queue` | [queue-mcp](https://github.com/mrconter1/queue-mcp) | A per-session task queue. Add work from another terminal without steering the running turn; Claude drains it one item at a time. |
+
+`mcp_install` also takes any git URL, or a local path for a private repo you
+already have. The layout it expects is the ordinary one: a package containing
+`server.py`, with `requirements.txt` beside it.
+
+A port is only useful if the server hears about it. Catalogue entries record
+the environment variable their server reads (`QUEUE_MCP_PORT` and so on). For
+other repositories, pass `port_env`. Without it, an install that would have to
+move off a taken port refuses rather than starting a server bound to the wrong
+one.
+
 ## Tools
 
-`mcp_list`, `mcp_status`, `mcp_start`, `mcp_stop`, `mcp_restart`,
-`mcp_autostart`, `mcp_enable`, `mcp_logs`, `mcp_stats`, `mcp_add`,
-`mcp_scaffold`, `mcp_remove`, `sessions_list`, `sessions_restart_pending`,
-`sessions_restart`, `sessions_restart_status`, `sessions_restart_clear`,
-`orchestrator_info`.
+| Tool | Purpose |
+| --- | --- |
+| `mcp_list` / `mcp_status` | every managed server with live state, or one in detail |
+| `mcp_start` / `mcp_stop` / `mcp_restart` | lifecycle |
+| `mcp_autostart` / `mcp_enable` | start at logon, or park a server |
+| `mcp_logs` | the tail of a server's log |
+| `mcp_stats` | uptime, availability, crashes, memory, CPU |
+| `mcp_catalogue` / `mcp_install` | see what is installable, and install it |
+| `mcp_scaffold` | create a new server from a template |
+| `mcp_add` / `mcp_remove` | manage a server already on disk, or stop managing one |
+| `mcp_uninstall` | stop, unregister, and optionally delete the directory |
+| `sessions_list` | running Claude Code sessions and their transcript ids |
+| `sessions_restart_pending` / `sessions_restart` | restart sessions at their next stop, or one now |
+| `sessions_restart_status` / `sessions_restart_clear` | inspect or cancel |
+| `orchestrator_info` | health of the orchestrator itself |
 
 ## Server states
 
@@ -41,6 +72,12 @@ sessions started afterwards. Undo with `.\install\uninstall.ps1`.
 
 `crashed` is deliberately distinct from `stopped`. A hidden server has no window
 to die in, so this state is the only evidence you get.
+
+A `crashed` or `unhealthy` server is restarted automatically on a backoff
+ladder of 5, 15, 45, 120 and 300 seconds. After five failures it is left alone
+and a notification says so, because a server still failing on the sixth attempt
+will not be fixed by a seventh. Two minutes of health clears the count. A
+`stopped` server is left stopped: somebody stopped it on purpose.
 
 ## Creating a server
 
@@ -118,10 +155,10 @@ log, and a way to ask the sessions to restart. Quitting leaves servers running.
 
 ## Known gaps
 
-- A crashed server is reported but not automatically restarted.
-- The at-logon trigger is configured but has only been triggered manually.
+- The at-logon trigger is configured but has only ever been triggered manually.
 - The live session restart path (`wt.exe` spawn plus `--resume`) is unproven.
 - `orchestrator.log` does not rotate; per-server logs rotate at 5 MB.
+- Windows only. The supervision, the tray and the installer all assume it.
 
 ## Not a Windows Service
 
