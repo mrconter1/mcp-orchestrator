@@ -196,8 +196,13 @@ def schedule_kill(pid: int, delay_ms: int = DEFAULT_DELAY_MS) -> int:
     """Kill ``pid`` after a delay, from a process that outlives this one.
 
     A session cannot terminate itself and still finish the turn that asked for
-    it, so the kill is handed off and delayed long enough for the replacement
-    terminal to come up.
+    it, so the kill is handed off and delayed.
+
+    The hosting shell is left alone on purpose. Terminating it gives it a
+    non-zero exit code, and Windows Terminal's default ``closeOnExit=graceful``
+    keeps a tab open on "[process exited with code ...]", which is worse than
+    the prompt it would otherwise show. Tabs close by exiting 0, which is what
+    :func:`_exit_zero` arranges for the tabs this code opens.
     """
     script = f"Start-Sleep -Milliseconds {int(delay_ms)}; Stop-Process -Id {int(pid)} -Force"
     helper = subprocess.Popen(  # noqa: S603
@@ -210,28 +215,99 @@ def schedule_kill(pid: int, delay_ms: int = DEFAULT_DELAY_MS) -> int:
     return helper.pid
 
 
+def _ps_quote(value: str) -> str:
+    """Single-quote a value for PowerShell, doubling any quotes inside it."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _exit_zero(inner: str) -> str:
+    """Wrap a command so its shell exits 0 however the command ends.
+
+    This is what closes the tab. Windows Terminal's default ``closeOnExit`` is
+    ``graceful``, meaning it closes a tab only on exit code 0, and a session
+    that was killed exits non-zero. Without this the replacement tab would
+    outlive its own session and sit on "[process exited with code ...]".
+
+    ``try{...}finally{...}`` rather than ``...; exit 0`` because a command
+    handed to wt must not contain a semicolon; wt reads it as its own separator.
+    """
+    return f"try{{{inner}}}finally{{exit 0}}"
+
+
 def restart_session(
     session_id: str,
     pid: int | None = None,
     cwd: str | None = None,
     delay_ms: int = DEFAULT_DELAY_MS,
 ) -> dict[str, Any]:
-    """Replace one session with a fresh one resuming the same transcript."""
+    """Replace one session with a fresh one resuming the same transcript.
+
+    The whole sequence runs in one detached helper, in this order: kill the old
+    session, pause, then open the replacement.
+
+    Killing first is the fix for a real failure. Spawning first left both
+    sessions alive at once, and because a resumed session keeps its id, two
+    workers claimed one session id: Remote Control evicted one and ``/rc``
+    failed in the new tab with code 4090.
+
+    The cost is a window where neither session exists. If the spawn then fails,
+    the transcript is still on disk and ``claude --resume <id>`` brings it back,
+    which is why this is the better trade.
+
+    Whether the old tab disappears depends on how it was started. A tab opened
+    by this code exits 0 and closes itself; one started by hand returns to its
+    shell prompt and stays, and there is no way to close it from outside that
+    does not leave a worse artefact behind.
+    """
     entry = registry.get(session_id) or {}
     pid = pid or entry.get("pid")
     cwd = cwd or entry.get("cwd")
     if not pid:
         raise LookupError(
             f"no pid known for session {session_id}; it is not in the registry, so the "
-            f"old process cannot be replaced -- start it once with the SessionStart hook "
+            f"old process cannot be replaced. Start it once with the SessionStart hook "
             f"installed, or restart it by hand"
         )
-    spawned = spawn_replacement(session_id, cwd)
-    killer = schedule_kill(int(pid), delay_ms)
+
+    working_dir = Path(cwd).expanduser() if cwd else Path.home()
+    if not working_dir.is_dir():
+        working_dir = Path.home()
+
+    steps = [
+        f"Start-Sleep -Milliseconds {int(delay_ms)}",
+        f"Stop-Process -Id {int(pid)} -Force -ErrorAction SilentlyContinue",
+        # Let the old worker's socket actually close before the replacement
+        # claims the same session id, or the eviction happens the other way.
+        "Start-Sleep -Milliseconds 1200",
+    ]
+
+    inner = _exit_zero(f"claude --resume {session_id}")
+    wt = _find_wt()
+    if wt:
+        steps.append(
+            f"& {_ps_quote(wt)} -w 0 new-tab --title claude -d {_ps_quote(str(working_dir))} "
+            f"powershell -Command {_ps_quote(inner)}"
+        )
+    else:
+        steps.append(
+            f"Start-Process powershell.exe -WorkingDirectory {_ps_quote(str(working_dir))} "
+            f"-ArgumentList '-Command',{_ps_quote(inner)}"
+        )
+
+    helper = subprocess.Popen(  # noqa: S603 -- every part is quoted above
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "; ".join(steps)],
+        cwd=str(working_dir),
+        env=_clean_env(),
+        creationflags=DETACHED,
+        close_fds=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     return {
         "session_id": session_id,
-        "replacement": spawned,
+        "helper_pid": helper.pid,
         "killing_pid": pid,
-        "killer_pid": killer,
+        "cwd": str(working_dir),
         "delay_ms": delay_ms,
+        "order": "kill the old session, pause, then open the replacement",
     }
