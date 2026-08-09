@@ -88,6 +88,15 @@ def _entry(name: str) -> dict[str, Any]:
     return _load_running().get(name, {})
 
 
+def runtime_state() -> dict[str, dict[str, Any]]:
+    """The raw per-server runtime record, for the stats layer to fold into."""
+    return _load_running()
+
+
+def save_runtime_state(data: dict[str, dict[str, Any]]) -> None:
+    _save_running(data)
+
+
 def _update_entry(name: str, **changes: Any) -> dict[str, Any]:
     data = _load_running()
     entry = dict(data.get(name, {}))

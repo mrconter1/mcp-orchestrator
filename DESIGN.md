@@ -4,6 +4,42 @@ Written 2026-08-09 by the session that designed this, for the session that build
 Everything here was either decided by the user or verified on this machine. Where
 something is unverified it says so.
 
+## First real task: a restart that is already pending
+
+`queue-mcp` has two commits (`51ce07c`, `a7391bf`) that are **not live**. The
+running server holds the old code in memory, so `~/.queue-mcp/history.jsonl`
+does not exist yet and nothing is being recorded. The log starts at the first
+completion after the server restarts.
+
+The user deliberately chose not to restart it by hand. Restarting the queue
+server detaches it from every running session, because Claude Code only
+attaches MCP servers at startup, so a bare restart silently costs those
+sessions their queue tools. That is exactly the problem requirement 3 exists to
+solve, which makes this the natural first exercise of the whole flow rather
+than a special case:
+
+1. restart the `queue` server
+2. write the pending-restart marker
+3. let each running session pick it up at its next natural stop and resume
+   itself, keeping its transcript and its queue
+
+Do not paper over it with a manual restart. If it cannot be done through the
+orchestrator yet, say so rather than doing it by hand, because the manual path
+is what hides whether requirement 3 actually works.
+
+Two known defects in this document, flagged but not corrected, because the user
+did not ask for the edit:
+
+- The session-registry section below overstates the problem. Resumed sessions
+  carry `--resume <session-id>` on their command line and `--name <name>` if
+  named, so most sessions can be identified with no hook at all. The
+  SessionStart hook is only needed for freshly started ones.
+- The Windows trap list predates one more trap, worth adding before spawning
+  anything: Windows Terminal's `closeOnExit` defaults to `graceful`, closing a
+  tab only on exit code **0**. Killing a tab's shell therefore *keeps* the tab
+  open on `[process exited with code ...]`. Make the shell exit 0 instead
+  (`try{...}finally{exit 0}`), and note `wt` forbids `;` in that string.
+
 ## What it is
 
 A standalone HTTP MCP server that manages the user's other local MCP servers:

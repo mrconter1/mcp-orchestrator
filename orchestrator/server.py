@@ -12,9 +12,12 @@ the tray icon, which on Windows has to own it.
 from __future__ import annotations
 
 import argparse
+import datetime
 import os
 import sys
 import threading
+import time
+import traceback
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -23,6 +26,7 @@ from orchestrator import (
     __version__,
     claude_cli,
     config,
+    monitor,
     paths,
     registry,
     restart,
@@ -33,6 +37,7 @@ from orchestrator.config import ServerSpec
 
 HOST = os.environ.get("MCP_ORCHESTRATOR_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MCP_ORCHESTRATOR_PORT", "8768"))
+BOOT_TIME = time.time()
 
 server = MCPServer(
     "orchestrator",
@@ -323,6 +328,34 @@ def mcp_scaffold(
 
 
 @server.tool()
+def mcp_stats(name: str | None = None) -> dict[str, Any]:
+    """Statistics for the managed servers: uptime, availability, crashes, resources.
+
+    Pass a name for one server, or nothing for all of them plus totals. Sampled
+    every 10 seconds by the orchestrator, so availability is measured over the
+    time it has been watching, not guessed from the current instant.
+
+    These are the orchestrator's own observations: whether each server is up,
+    how long it has stayed up, how often it died, and what it costs in memory
+    and CPU. It does not see traffic, so there are no per-tool call counts here
+    unless a server reports them itself.
+    """
+    data = monitor.stats()
+    if name is not None:
+        for entry in data["servers"]:
+            if entry["name"] == name:
+                return _ok(**entry)
+        return _err(f"no server named {name!r}")
+    return _ok(
+        **data,
+        orchestrator={
+            "uptime_seconds": int(time.time() - BOOT_TIME),
+            "started": datetime.datetime.fromtimestamp(BOOT_TIME).isoformat(timespec="seconds"),
+        },
+    )
+
+
+@server.tool()
 def sessions_list() -> dict[str, Any]:
     """List the running Claude Code sessions, with pid and transcript session id.
 
@@ -422,11 +455,52 @@ def start_mcp_thread() -> threading.Thread:
 
 
 def boot(autostart: bool = True) -> dict[str, Any]:
-    """Adopt whatever survived, then start the servers marked autostart."""
+    """Adopt whatever survived, start the autostart servers, begin watching."""
     specs = config.load()
     adopted = supervise.reconcile(specs)
     started = supervise.autostart_all(specs) if autostart else []
+    # Independent of the tray: headless, nothing else would ever notice a crash.
+    monitor.Monitor().start()
     return {"adopted": adopted, "started": started, "managed": len(specs)}
+
+
+_stdout_is_log = False
+
+
+def _setup_output() -> Any:
+    """Give the orchestrator somewhere to speak.
+
+    It normally runs under pythonw.exe from Task Scheduler, which has no console
+    at all: ``sys.stdout`` and ``sys.stderr`` are None, and the first thing that
+    logs -- ours or uvicorn's -- dies on ``NoneType.write``. The process stays
+    alive with nothing listening, which is indistinguishable from a missing
+    tool. So everything goes to a file, and the standard streams are pointed at
+    it when they do not exist.
+    """
+    global _stdout_is_log
+    handle = open(paths.logs_dir() / "orchestrator.log", "a", encoding="utf-8", buffering=1)
+    if sys.stdout is None:
+        sys.stdout = handle
+        _stdout_is_log = True
+    if sys.stderr is None:
+        sys.stderr = handle
+    return handle
+
+
+def log(message: str) -> None:
+    """Write to the orchestrator's own log, and to the console if there is one."""
+    line = f"{datetime.datetime.now().isoformat(timespec='seconds')} {message}"
+    try:
+        with open(paths.logs_dir() / "orchestrator.log", "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        pass
+    # Skip the echo when stdout *is* the log file, or every line lands twice.
+    if sys.stdout is not None and not _stdout_is_log:
+        try:
+            print(line, flush=True)
+        except (ValueError, OSError):
+            pass
 
 
 def main() -> None:
@@ -435,24 +509,38 @@ def main() -> None:
     parser.add_argument("--no-autostart", action="store_true", help="do not start servers at boot")
     args = parser.parse_args()
 
-    print(f"mcp-orchestrator {__version__} listening on http://{HOST}:{PORT}/mcp", flush=True)
-    print(f"state: {paths.home()}", flush=True)
-    result = boot(autostart=not args.no_autostart)
-    for entry in result["started"]:
-        print(f"  {entry.get('name')}: {entry.get('state')} {entry.get('error') or ''}", flush=True)
+    _setup_output()
+    try:
+        log(f"mcp-orchestrator {__version__} starting on http://{HOST}:{PORT}/mcp")
+        log(f"state: {paths.home()}")
+        result = boot(autostart=not args.no_autostart)
+        for entry in result["started"]:
+            log(f"  {entry.get('name')}: {entry.get('state')} {entry.get('error') or ''}")
 
-    start_mcp_thread()
+        start_mcp_thread()
+        for _ in range(100):  # the endpoint is the whole point; say whether it came up
+            if supervise.port_open(PORT):
+                log(f"listening on http://{HOST}:{PORT}/mcp")
+                break
+            time.sleep(0.1)
+        else:
+            log(f"WARNING: nothing listening on {PORT} after 10s")
 
-    if not args.no_tray:
-        try:
-            from orchestrator import tray
+        if not args.no_tray:
+            try:
+                from orchestrator import tray
 
-            tray.run(shutdown=lambda: None)
-            return
-        except ImportError as exc:  # pystray missing: better headless than dead
-            print(f"tray unavailable ({exc}); running headless", flush=True)
+                log("tray icon starting")
+                tray.run(port=PORT)
+                log("tray closed; shutting down")
+                return
+            except ImportError as exc:  # pystray missing: better headless than dead
+                log(f"tray unavailable ({exc}); running headless")
 
-    threading.Event().wait()
+        threading.Event().wait()
+    except Exception:  # noqa: BLE001 -- a crash with no console leaves no other trace
+        log("FATAL: " + traceback.format_exc())
+        raise
 
 
 if __name__ == "__main__":
