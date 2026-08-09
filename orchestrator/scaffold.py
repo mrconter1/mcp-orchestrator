@@ -85,7 +85,7 @@ def _write_files(target: Path, name: str, package: str, port: int) -> list[str]:
     return written
 
 
-def _create_venv(target: Path) -> dict[str, Any]:
+def create_venv(target: Path) -> dict[str, Any]:
     """Build the venv and install the SDK, reporting what pip actually said."""
     venv = target / ".venv"
     result = subprocess.run(  # noqa: S603
@@ -129,7 +129,7 @@ def create(
 
     steps: dict[str, Any] = {}
     steps["files"] = _write_files(target, name, package, port)
-    steps["venv"] = _create_venv(target)
+    steps["venv"] = create_venv(target)
 
     spec = config.ServerSpec(
         name=name,

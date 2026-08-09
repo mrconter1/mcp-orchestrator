@@ -24,6 +24,7 @@ from mcp.server.mcpserver import MCPServer
 
 from orchestrator import (
     __version__,
+    catalogue,
     claude_cli,
     config,
     monitor,
@@ -324,6 +325,63 @@ def mcp_scaffold(
     if register and "error" not in result.get("registration", {}):
         result.update(_finish_install(f"scaffolded MCP server {name!r}", restart_sessions))
     result["next"] = f"Edit {result['edit']} to add tools, then mcp_restart({name!r})."
+    return _ok(**result)
+
+
+@server.tool()
+def mcp_catalogue() -> dict[str, Any]:
+    """List the MCP servers that can be installed with one call, and their status.
+
+    These are known-good servers that install straight from their repository.
+    mcp_install also takes any git URL for a server laid out the same way: a
+    package containing server.py, with a requirements.txt beside it.
+    """
+    managed = {spec.name for spec in config.load()}
+    return _ok(
+        servers=[
+            {**entry, "installed": entry["name"] in managed}
+            for entry in catalogue.CATALOGUE
+        ],
+        count=len(catalogue.CATALOGUE),
+        note="Install with mcp_install('<name>'), or mcp_install('<git url>').",
+    )
+
+
+@server.tool()
+def mcp_install(
+    name_or_url: str,
+    name: str | None = None,
+    module: str | None = None,
+    directory: str | None = None,
+    port: int | None = None,
+    port_env: str | None = None,
+    register: bool = True,
+    start: bool = True,
+    autostart: bool = True,
+    restart_sessions: bool = True,
+) -> dict[str, Any]:
+    """Install an MCP server from a git repository and put it under management.
+
+    Takes a catalogue name (see mcp_catalogue), a git URL, or a local repo
+    path. Clones it to ~/Repos, builds a venv from its requirements.txt,
+    allocates a port, registers it with Claude Code and starts it.
+
+    port_env is the environment variable the server reads its port from, for
+    example QUEUE_MCP_PORT. Catalogue entries know their own. Without it a
+    server cannot be moved off its hardcoded port, so an install that needs to
+    move will refuse rather than start something that binds the wrong port.
+
+    Use this for a server that already exists. Use mcp_scaffold to write a new
+    one from scratch. Takes a minute or so, most of it pip.
+    """
+    try:
+        result = catalogue.install(
+            name_or_url, name, module, directory, port, port_env, register, start, autostart
+        )
+    except (catalogue.InstallError, scaffold.ScaffoldError, supervise.SuperviseError, OSError) as exc:
+        return _err(str(exc))
+    if register and "error" not in result.get("registration", {}):
+        result.update(_finish_install(f"installed MCP server {result['name']!r}", restart_sessions))
     return _ok(**result)
 
 
