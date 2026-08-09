@@ -93,6 +93,7 @@ def stats() -> dict[str, Any]:
                 "last_seen_up": entry.get("last_seen_up"),
                 "memory_mb": state.get("memory_mb"),
                 "cpu_percent": state.get("cpu_percent"),
+                "processes": state.get("processes"),
                 "probe_ms": state.get("probe_ms"),
                 "last_error": entry.get("last_error"),
                 "last_exit": entry.get("last_exit"),

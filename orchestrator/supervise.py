@@ -150,6 +150,58 @@ def _live_process(entry: dict[str, Any]) -> psutil.Process | None:
     return proc
 
 
+# psutil measures CPU as the change between two reads of the *same* Process
+# object, so a fresh object always answers 0.0. Keeping them alive between polls
+# is what turns cpu_percent into a real number instead of a permanent zero.
+_proc_cache: dict[int, psutil.Process] = {}
+
+
+def _cached(pid: int) -> psutil.Process:
+    proc = _proc_cache.get(pid)
+    if proc is None:
+        proc = psutil.Process(pid)
+        proc.cpu_percent(interval=None)  # prime it; this first read is the 0.0
+        _proc_cache[pid] = proc
+    return proc
+
+
+def _tree_resources(proc: psutil.Process) -> tuple[float | None, float | None, int]:
+    """Memory and CPU for a server, summed over its whole process tree.
+
+    The command we launch is usually a thin launcher that re-executes the real
+    interpreter, and it is the *child* that holds the listening socket and does
+    the work. Measuring only the tracked pid reported every server as an
+    identical 4 MB, which is the launcher, not the server.
+    """
+    try:
+        members = [proc, *proc.children(recursive=True)]
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return None, None, 0
+
+    memory = 0.0
+    cpu = 0.0
+    counted = 0
+    for member in members:
+        try:
+            tracked = _cached(member.pid)
+            with tracked.oneshot():
+                memory += tracked.memory_info().rss
+                cpu += tracked.cpu_percent(interval=None)
+            counted += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+            _proc_cache.pop(member.pid, None)
+            continue
+
+    if not counted:
+        return None, None, 0
+    # Drop cache entries for processes that have since died, so a long-running
+    # orchestrator does not accumulate one per restarted server forever.
+    if len(_proc_cache) > 64:
+        for pid in [p for p, c in _proc_cache.items() if not c.is_running()]:
+            del _proc_cache[pid]
+    return round(memory / (1024 * 1024), 1), round(cpu, 1), counted
+
+
 def _note_crash(name: str) -> dict[str, Any]:
     """Record that a server we started died by itself.
 
@@ -224,11 +276,12 @@ def status(spec: ServerSpec) -> dict[str, Any]:
     if proc:
         try:
             info["uptime_seconds"] = int(time.time() - proc.create_time())
-            with proc.oneshot():
-                info["memory_mb"] = round(proc.memory_info().rss / (1024 * 1024), 1)
-                info["cpu_percent"] = proc.cpu_percent(interval=None)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
+        memory, cpu, count = _tree_resources(proc)
+        info["memory_mb"] = memory
+        info["cpu_percent"] = cpu
+        info["processes"] = count
     return info
 
 
