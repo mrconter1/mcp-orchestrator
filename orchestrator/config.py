@@ -34,8 +34,8 @@ from orchestrator import paths
 DEFAULT_PATH = "/mcp"
 CONFIG_VERSION = 1
 
-# 8765-8767 are already taken on this machine (queue-mcp, session-control-mcp and
-# one other), and 8768 is the orchestrator itself, so scaffolding allocates above.
+# 8768 is the orchestrator itself and the ports just below it are commonly taken
+# by other local MCP servers, so scaffolding allocates above that.
 PORT_RANGE = (8769, 8899)
 
 

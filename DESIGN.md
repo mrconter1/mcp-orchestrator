@@ -179,13 +179,20 @@ debugging round today:
 - **Start servers from a terminal the user owns, or detached.** A server started
   as a Claude background task dies when that session tears down.
 
-## Working agreements in force
+## What was built from this
 
-From `~/CLAUDE.md`, which the build session will also load:
+All of the above, plus two things this document did not anticipate:
 
-- Commit freely, locally. **Never push.** Never pull, merge or rebase.
-- Everything the user asks you to *do* goes in the queue first, single tasks
-  included. Only *say* answers (questions, opinions, design discussion) are
-  inline.
-- No em dashes in responses.
-- Refer to the user as "the user", not by name.
+- **The orchestrator needs its own log.** Under Task Scheduler there is no
+  console at all, so `sys.stdout` is None and the first log line kills the
+  process. It started, held a pid, and never opened its port. Exactly the
+  failure this design was written to prevent, arriving through a door the
+  design did not think to close.
+- **Resources must be measured across the process tree.** The command being
+  launched is usually a thin launcher that re-executes the real interpreter,
+  and it is the child that holds the socket.
+
+One assumption here also turned out to be too strong. "Claude Code attaches MCP
+servers only at process startup" is true for *adding* a server, but restarting
+an already-attached one is fine: the HTTP client reconnects per call. Only
+adding and removing require a session restart.
