@@ -43,6 +43,17 @@ def package_name(name: str) -> str:
     return base if base.endswith("_mcp") else f"{base}_mcp"
 
 
+def identifier(name: str) -> str:
+    """``nuclino-write`` -> ``nuclino_write``: usable in a Python function name.
+
+    Names are allowed to contain hyphens (they end up in a URL and a CLI
+    argument), so anything interpolated into generated *code* has to come
+    through here. Using the raw name produced ``def nuclino-write_ping`` and a
+    server that crashed on startup with a SyntaxError.
+    """
+    return name.replace("-", "_")
+
+
 def _base_python() -> str:
     """The interpreter to build the new venv with.
 
@@ -64,6 +75,7 @@ def _render(template: str, substitutions: dict[str, str]) -> str:
 def _write_files(target: Path, name: str, package: str, port: int) -> list[str]:
     substitutions = {
         "__NAME__": name,
+        "__IDENT__": identifier(name),
         "__PACKAGE__": package,
         "__PORT__": str(port),
         "__ENV_PREFIX__": package.upper(),
@@ -80,7 +92,19 @@ def _write_files(target: Path, name: str, package: str, port: int) -> list[str]:
     for relative, template in files.items():
         path = target / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_render(template, substitutions), encoding="utf-8")
+        rendered = _render(template, substitutions)
+        # Refuse to ship code that cannot run. Without this a template bug
+        # produces a repo, a venv, a registration and a server that dies on
+        # startup, reported as "crashed" with the real cause buried in a log.
+        if relative.endswith(".py"):
+            try:
+                compile(rendered, str(path), "exec")
+            except SyntaxError as exc:
+                raise ScaffoldError(
+                    f"generated {relative} is not valid Python ({exc.msg} at line {exc.lineno}). "
+                    f"This is a bug in {template}, not in the name {name!r}."
+                ) from exc
+        path.write_text(rendered, encoding="utf-8")
         written.append(str(path))
     return written
 
