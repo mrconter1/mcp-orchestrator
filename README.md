@@ -58,8 +58,15 @@ letting a dead one look like a missing tool.
   will not touch it.
 - **A start waits for the port** before reporting success. A pid proves
   nothing.
-- **Crashes are restarted** on a 5, 15, 45, 120, 300 second ladder, then
-  abandoned with a notification. Two minutes of health clears the count.
+- **Servers outlive the orchestrator.** On startup it re-adopts anything still
+  running its configured command, matched by command line, so a server started
+  by a previous orchestrator is supervised rather than written off as
+  `external` and left to fend for itself.
+- **Anything down is restarted** on a 5, 15, 45, 120, 300 second ladder, then
+  abandoned with a notification. Two minutes of health clears the count. Down
+  means down: `crashed`, `unhealthy`, or simply not running. The one exception
+  is a server stopped through `mcp_stop`, which is recorded as deliberate at the
+  moment it is asked for and left alone until it is started again.
 - **The tray colour is the summary.** Green up, amber starting or stopped, red
   with an exclamation for trouble.
 

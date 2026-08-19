@@ -59,15 +59,26 @@ def _notify(title: str, message: str) -> None:
 def _recover(spec: Any, state: dict[str, Any], entry: dict[str, Any], now: float) -> dict[str, Any]:
     """Restart a server that died, or give up loudly.
 
-    Only ``crashed`` and ``unhealthy`` are recoverable. ``stopped`` means
-    somebody stopped it on purpose and restarting it would be the orchestrator
-    arguing with the user; ``external`` is not ours to touch.
+    ``crashed`` and ``unhealthy`` are always recoverable. ``external`` is not
+    ours to touch.
+
+    ``stopped`` is the subtle one. It usually means somebody stopped the server
+    on purpose, and restarting it would be the orchestrator arguing with the
+    user. But it is also where a server lands when it is simply down and we hold
+    no record of it -- and treating that as intent left three servers dead for
+    hours with autostart and auto_restart both on. So intent is now recorded
+    explicitly at the point it is expressed, by ``supervise.stop``, and only a
+    server carrying that flag is left alone.
     """
-    recoverable = state["state"] in ("crashed", "unhealthy")
+    state_name = state["state"]
+    deliberate = bool(entry.get("stopped_by_user"))
+    recoverable = state_name in ("crashed", "unhealthy") or (
+        state_name == "stopped" and not deliberate and spec.autostart
+    )
 
     if not recoverable:
         # A sustained healthy run wipes the slate, including a previous give-up.
-        if state["state"] == "running" and (state.get("uptime_seconds") or 0) >= STABLE_SECONDS:
+        if state_name == "running" and (state.get("uptime_seconds") or 0) >= STABLE_SECONDS:
             if entry.get("restart_attempts") or entry.get("gave_up"):
                 entry["restart_attempts"] = 0
                 entry["gave_up"] = False
@@ -77,7 +88,7 @@ def _recover(spec: Any, state: dict[str, Any], entry: dict[str, Any], now: float
     if not (spec.enabled and spec.auto_restart) or entry.get("gave_up"):
         return entry
 
-    attempts = int(entry.get("restart_attempts", 0))
+    attempts = int(entry.get("restart_attempts") or 0)
     next_retry = entry.get("next_retry_epoch")
     if next_retry is not None and now < float(next_retry):
         return entry  # still serving the backoff
@@ -105,7 +116,7 @@ def _recover(spec: Any, state: dict[str, Any], entry: dict[str, Any], now: float
     if ok:
         _notify(
             "MCP server restarted",
-            f"{spec.name} had crashed and was restarted automatically "
+            f"{spec.name} was {state_name} and has been restarted automatically "
             f"(attempt {attempts + 1}).",
         )
     return entry
@@ -123,8 +134,8 @@ def sample() -> list[dict[str, Any]]:
         entry = dict(data.get(state["name"], {}))
         up = state["state"] in ("running", "external")
 
-        entry["samples"] = int(entry.get("samples", 0)) + 1
-        entry["samples_up"] = int(entry.get("samples_up", 0)) + (1 if up else 0)
+        entry["samples"] = int(entry.get("samples") or 0) + 1
+        entry["samples_up"] = int(entry.get("samples_up") or 0) + (1 if up else 0)
         entry.setdefault("watching_since", _now())
 
         # Accumulate runtime from the gap between samples rather than from the
@@ -151,11 +162,20 @@ def sample() -> list[dict[str, Any]]:
     # its updates rather than clobbering them with our older snapshot.
     fresh = supervise.runtime_state()
     for name, entry in data.items():
-        merged = dict(fresh.get(name, {}))
+        current = fresh.get(name, {})
+        merged = dict(current)
         merged.update(entry)
-        for key in ("pid", "create_time", "started", "started_epoch", "starts", "crashed_at"):
-            if name in fresh:
-                merged[key] = fresh[name].get(key)
+        # These keys belong to supervise, so its copy wins -- but only where it
+        # actually has one. A bare .get() invents a null for every server
+        # supervise has not started, and a null `starts` then makes the next
+        # start die on int(None) while a null pid makes a dead server look
+        # merely `stopped`, which is the one state the monitor will not fix.
+        for key in (
+            "pid", "create_time", "started", "started_epoch", "starts",
+            "crashes", "crashed_at", "stopped_by_user", "adopted",
+        ):
+            if key in current:
+                merged[key] = current[key]
         fresh[name] = merged
     supervise.save_runtime_state(fresh)
     return states
@@ -173,8 +193,8 @@ def stats() -> dict[str, Any]:
     for spec in specs:
         state = states.get(spec.name, {})
         entry = data.get(spec.name, {})
-        samples = int(entry.get("samples", 0))
-        up = int(entry.get("samples_up", 0))
+        samples = int(entry.get("samples") or 0)
+        up = int(entry.get("samples_up") or 0)
         servers.append(
             {
                 "name": spec.name,
