@@ -91,7 +91,12 @@ def read_json(path: Path, default: Any) -> Any:
     but a crash on startup costs every server at once.
     """
     try:
-        text = path.read_text(encoding="utf-8")
+        # utf-8-sig, not utf-8: these files are meant to be hand-editable, and a
+        # Windows editor (or Set-Content -Encoding utf8) writes a BOM. Plain
+        # utf-8 turns that into a JSONDecodeError, which lands in the except
+        # below and silently returns the default -- losing every recorded pid
+        # and leaving the whole server set unsupervised.
+        text = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return default
     except OSError:

@@ -125,6 +125,11 @@ def _recover(spec: Any, state: dict[str, Any], entry: dict[str, Any], now: float
 def sample() -> list[dict[str, Any]]:
     """Take one reading of every managed server and fold it into the stats."""
     specs = config.load()
+    # Reclaim anything running that we have lost the record for, before reading
+    # state -- otherwise it reads as `external` and is skipped by _recover, and
+    # a server can end up unsupervised for as long as it happens to stay up.
+    for name in supervise.adopt_orphans(specs):
+        _notify("MCP server adopted", f"{name} was running unsupervised and is now tracked.")
     states = supervise.status_all(specs)  # this is also what detects a crash
     data = supervise.runtime_state()
     now = time.time()

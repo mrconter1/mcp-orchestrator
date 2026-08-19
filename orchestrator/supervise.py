@@ -498,7 +498,28 @@ def _normalise(command: list[str]) -> list[str]:
     return [str(part).replace("\\", "/").casefold() for part in command]
 
 
-def find_running(spec: ServerSpec) -> psutil.Process | None:
+def _command_index() -> dict[tuple[str, ...], list[tuple[int, int | None, psutil.Process]]]:
+    """One sweep of every process, keyed by command line.
+
+    Built once per adoption pass rather than once per server: enumerating a few
+    hundred processes with their command lines is the expensive part, and doing
+    it per spec turned a cheap check into a visible cost every ten seconds.
+    """
+    index: dict[tuple[str, ...], list[tuple[int, int | None, psutil.Process]]] = {}
+    for proc in psutil.process_iter(["pid", "ppid", "cmdline"]):
+        try:
+            cmdline = proc.info.get("cmdline")
+            if not cmdline:
+                continue
+            index.setdefault(tuple(_normalise(cmdline)), []).append(
+                (proc.info["pid"], proc.info.get("ppid"), proc)
+            )
+        except (psutil.NoSuchProcess, psutil.AccessDenied, TypeError):
+            continue
+    return index
+
+
+def find_running(spec: ServerSpec, index: dict | None = None) -> psutil.Process | None:
     """A process already running this server's exact command, if there is one.
 
     This is how a server survives losing its runtime record -- an orchestrator
@@ -511,20 +532,53 @@ def find_running(spec: ServerSpec) -> psutil.Process | None:
     line, so a match is normally two processes deep. We want the outermost one,
     because ``stop`` kills the tree downwards from the pid it recorded.
     """
-    target = _normalise(spec.command)
-    matches: dict[int, psutil.Process] = {}
-    parents: dict[int, int] = {}
-    for proc in psutil.process_iter(["pid", "ppid", "cmdline"]):
-        try:
-            if _normalise(proc.info.get("cmdline") or []) == target:
-                matches[proc.info["pid"]] = proc
-                parents[proc.info["pid"]] = proc.info.get("ppid")
-        except (psutil.NoSuchProcess, psutil.AccessDenied, TypeError):
-            continue
-    if not matches:
+    index = _command_index() if index is None else index
+    found = index.get(tuple(_normalise(spec.command)))
+    if not found:
         return None
-    outermost = [pid for pid in matches if parents.get(pid) not in matches]
-    return matches[min(outermost or list(matches))]
+    pids = {pid for pid, _, _ in found}
+    outermost = [entry for entry in found if entry[1] not in pids]
+    return min(outermost or found, key=lambda entry: entry[0])[2]
+
+
+def adopt_orphans(specs: list[ServerSpec], data: dict[str, dict[str, Any]] | None = None) -> list[str]:
+    """Claim any configured server that is running without us holding its record.
+
+    Runs at startup *and* on every monitor pass, because the record can go
+    missing at any time -- a hand-edited ``running.json``, a torn write, an
+    orchestrator killed rather than shut down. An unclaimed server reads as
+    ``external``, which is never supervised and never restarted, so leaving this
+    to startup alone means a lost record quietly disarms the supervisor until
+    somebody reboots.
+    """
+    save = data is None
+    data = _load_running() if data is None else data
+    unclaimed = [spec for spec in specs if not _live_process(data.get(spec.name, {}))]
+    if not unclaimed:
+        return []  # the healthy case: no process sweep at all
+
+    index = _command_index()
+    claimed: list[str] = []
+    for spec in unclaimed:
+        entry = dict(data.get(spec.name, {}))
+        proc = find_running(spec, index)
+        if proc is None:
+            continue
+        try:
+            entry["create_time"] = proc.create_time()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        entry["pid"] = proc.pid
+        entry["starts"] = int(entry.get("starts") or 0)
+        entry["crashes"] = int(entry.get("crashes") or 0)
+        entry["crashed_at"] = None
+        entry["stopped_by_user"] = False
+        entry["adopted"] = _now()
+        data[spec.name] = entry
+        claimed.append(spec.name)
+    if save and claimed:
+        _save_running(data)
+    return claimed
 
 
 def reconcile(specs: list[ServerSpec]) -> dict[str, Any]:
@@ -557,26 +611,9 @@ def reconcile(specs: list[ServerSpec]) -> dict[str, Any]:
 
     # Anything still running from an earlier orchestrator, whose record we no
     # longer hold: claim it by command line rather than leaving it unsupervised.
-    for spec in specs:
-        entry = dict(data.get(spec.name, {}))
-        if _live_process(entry):
-            continue
-        proc = find_running(spec)
-        if proc is None:
-            continue
-        try:
-            entry["create_time"] = proc.create_time()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-        entry["pid"] = proc.pid
-        entry["starts"] = int(entry.get("starts") or 0)
-        entry["crashes"] = int(entry.get("crashes") or 0)
-        entry["crashed_at"] = None
-        entry["stopped_by_user"] = False
-        entry["adopted"] = _now()
-        data[spec.name] = entry
-        if spec.name not in adopted:
-            adopted.append(spec.name)
+    for name in adopt_orphans(specs, data):
+        if name not in adopted:
+            adopted.append(name)
 
     _save_running(data)
     return {"adopted": adopted, "lost": lost}
