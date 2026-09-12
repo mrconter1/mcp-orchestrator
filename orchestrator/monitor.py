@@ -13,6 +13,7 @@ and a server could be dead for hours before anyone noticed.
 from __future__ import annotations
 
 import datetime
+import os
 import threading
 import time
 from typing import Any
@@ -31,6 +32,18 @@ MAX_ATTEMPTS = len(BACKOFF_SECONDS)
 # this, a server that crashes once a day would eventually exhaust its attempts
 # and stay down, having been healthy for weeks in between.
 STABLE_SECONDS = 120
+
+# How many consecutive samples a server must read ``unhealthy`` (alive, not
+# listening) before it is restarted. One sample is a single 350 ms connect,
+# and an event loop that is merely busy can miss one; a process that is gone
+# needs no such patience, so ``crashed`` is acted on at once.
+UNHEALTHY_SAMPLES = 2
+
+# Consecutive samples our own endpoint may be dead before the process gives
+# up on itself. Only counted once the port has been seen up, so a slow start
+# is not mistaken for a death.
+OWN_PORT_DEAD_SAMPLES = 3
+OWN_PORT_EXIT_CODE = 3
 
 # Set by the tray so crash-loop warnings can reach the user. Left as None when
 # running headless, where the log is the only place to say it.
@@ -59,25 +72,43 @@ def _notify(title: str, message: str) -> None:
 def _recover(spec: Any, state: dict[str, Any], entry: dict[str, Any], now: float) -> dict[str, Any]:
     """Restart a server that died, or give up loudly.
 
-    Only ``crashed`` and ``unhealthy`` are recoverable. ``stopped`` means
-    somebody stopped it on purpose and restarting it would be the orchestrator
-    arguing with the user; ``external`` is not ours to touch.
+    ``crashed`` and ``unhealthy`` are always recoverable. ``external`` is not
+    ours to touch.
+
+    ``stopped`` is the subtle one. It usually means somebody stopped the server
+    on purpose, and restarting it would be the orchestrator arguing with the
+    user. But it is also where a server lands when it is simply down and we hold
+    no record of it -- and treating that as intent left three servers dead for
+    hours with autostart and auto_restart both on. So intent is now recorded
+    explicitly at the point it is expressed, by ``supervise.stop``, and only a
+    server carrying that flag is left alone.
     """
-    recoverable = state["state"] in ("crashed", "unhealthy")
+    state_name = state["state"]
+    deliberate = bool(entry.get("stopped_by_user"))
+    recoverable = state_name in ("crashed", "unhealthy") or (
+        state_name == "stopped" and not deliberate and spec.autostart
+    )
 
     if not recoverable:
+        entry["unhealthy_samples"] = 0
         # A sustained healthy run wipes the slate, including a previous give-up.
-        if state["state"] == "running" and (state.get("uptime_seconds") or 0) >= STABLE_SECONDS:
+        if state_name == "running" and (state.get("uptime_seconds") or 0) >= STABLE_SECONDS:
             if entry.get("restart_attempts") or entry.get("gave_up"):
                 entry["restart_attempts"] = 0
                 entry["gave_up"] = False
                 entry["next_retry_epoch"] = None
         return entry
 
+    if state_name == "unhealthy":
+        seen = int(entry.get("unhealthy_samples") or 0) + 1
+        entry["unhealthy_samples"] = seen
+        if seen < UNHEALTHY_SAMPLES:
+            return entry  # one missed probe is not a verdict
+
     if not (spec.enabled and spec.auto_restart) or entry.get("gave_up"):
         return entry
 
-    attempts = int(entry.get("restart_attempts", 0))
+    attempts = int(entry.get("restart_attempts") or 0)
     next_retry = entry.get("next_retry_epoch")
     if next_retry is not None and now < float(next_retry):
         return entry  # still serving the backoff
@@ -105,7 +136,7 @@ def _recover(spec: Any, state: dict[str, Any], entry: dict[str, Any], now: float
     if ok:
         _notify(
             "MCP server restarted",
-            f"{spec.name} had crashed and was restarted automatically "
+            f"{spec.name} was {state_name} and has been restarted automatically "
             f"(attempt {attempts + 1}).",
         )
     return entry
@@ -114,6 +145,11 @@ def _recover(spec: Any, state: dict[str, Any], entry: dict[str, Any], now: float
 def sample() -> list[dict[str, Any]]:
     """Take one reading of every managed server and fold it into the stats."""
     specs = config.load()
+    # Reclaim anything running that we have lost the record for, before reading
+    # state -- otherwise it reads as `external` and is skipped by _recover, and
+    # a server can end up unsupervised for as long as it happens to stay up.
+    for name in supervise.adopt_orphans(specs):
+        _notify("MCP server adopted", f"{name} was running unsupervised and is now tracked.")
     states = supervise.status_all(specs)  # this is also what detects a crash
     data = supervise.runtime_state()
     now = time.time()
@@ -123,8 +159,8 @@ def sample() -> list[dict[str, Any]]:
         entry = dict(data.get(state["name"], {}))
         up = state["state"] in ("running", "external")
 
-        entry["samples"] = int(entry.get("samples", 0)) + 1
-        entry["samples_up"] = int(entry.get("samples_up", 0)) + (1 if up else 0)
+        entry["samples"] = int(entry.get("samples") or 0) + 1
+        entry["samples_up"] = int(entry.get("samples_up") or 0) + (1 if up else 0)
         entry.setdefault("watching_since", _now())
 
         # Accumulate runtime from the gap between samples rather than from the
@@ -151,11 +187,20 @@ def sample() -> list[dict[str, Any]]:
     # its updates rather than clobbering them with our older snapshot.
     fresh = supervise.runtime_state()
     for name, entry in data.items():
-        merged = dict(fresh.get(name, {}))
+        current = fresh.get(name, {})
+        merged = dict(current)
         merged.update(entry)
-        for key in ("pid", "create_time", "started", "started_epoch", "starts", "crashed_at"):
-            if name in fresh:
-                merged[key] = fresh[name].get(key)
+        # These keys belong to supervise, so its copy wins -- but only where it
+        # actually has one. A bare .get() invents a null for every server
+        # supervise has not started, and a null `starts` then makes the next
+        # start die on int(None) while a null pid makes a dead server look
+        # merely `stopped`, which is the one state the monitor will not fix.
+        for key in (
+            "pid", "create_time", "started", "started_epoch", "starts",
+            "crashes", "crashed_at", "stopped_by_user", "adopted",
+        ):
+            if key in current:
+                merged[key] = current[key]
         fresh[name] = merged
     supervise.save_runtime_state(fresh)
     return states
@@ -173,8 +218,8 @@ def stats() -> dict[str, Any]:
     for spec in specs:
         state = states.get(spec.name, {})
         entry = data.get(spec.name, {})
-        samples = int(entry.get("samples", 0))
-        up = int(entry.get("samples_up", 0))
+        samples = int(entry.get("samples") or 0)
+        up = int(entry.get("samples_up") or 0)
         servers.append(
             {
                 "name": spec.name,
@@ -218,18 +263,53 @@ def stats() -> dict[str, Any]:
 
 
 class Monitor:
-    """The sampling thread."""
+    """The sampling thread.
 
-    def __init__(self, interval: float = SAMPLE_SECONDS) -> None:
+    ``own_port`` is the orchestrator's own MCP endpoint. When given, the thread
+    also watches that, and exits the whole process once it has been dead for
+    ``OWN_PORT_DEAD_SAMPLES`` samples. That sounds drastic and is the gentler
+    option: the servers are detached and survive, the Scheduled Task restarts
+    a run that exits non-zero, and the replacement re-adopts them. The
+    alternative, seen in practice, is an orchestrator whose endpoint died
+    quietly and stayed dead for two days while the process looked fine.
+    """
+
+    def __init__(self, interval: float = SAMPLE_SECONDS, own_port: int | None = None) -> None:
         self.interval = interval
+        self.own_port = own_port
+        self._own_seen_up = False
+        self._own_dead = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+
+    def _check_own_port(self) -> None:
+        if not self.own_port:
+            return
+        if supervise.port_open(self.own_port):
+            self._own_seen_up = True
+            self._own_dead = 0
+            return
+        if not self._own_seen_up:
+            return  # still starting
+        self._own_dead += 1
+        if self._own_dead < OWN_PORT_DEAD_SAMPLES:
+            return
+        _notify(
+            "MCP orchestrator endpoint died",
+            f"port {self.own_port} stopped answering; exiting with code "
+            f"{OWN_PORT_EXIT_CODE} so the Scheduled Task starts a fresh orchestrator.",
+        )
+        os._exit(OWN_PORT_EXIT_CODE)
 
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
                 sample()
             except Exception:  # noqa: BLE001 -- the watcher must outlive what it watches
+                pass
+            try:
+                self._check_own_port()
+            except Exception:  # noqa: BLE001
                 pass
             self._stop.wait(self.interval)
 

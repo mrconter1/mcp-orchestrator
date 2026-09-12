@@ -12,6 +12,7 @@ the tray icon, which on Windows has to own it.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import datetime
 import os
 import sys
@@ -531,7 +532,18 @@ def start_mcp_thread() -> threading.Thread:
     """
 
     def run() -> None:
-        server.run(transport="streamable-http", host=HOST, port=PORT)
+        # Not ``server.run``: that lands on Python's default Windows loop, the
+        # Proactor, whose accept loop *closes the listening socket* when a
+        # client resets a connection before the accept completes (WinError 64,
+        # "the specified network name is no longer available"). The process
+        # then lives on with nothing listening, which is precisely the failure
+        # this whole program exists to prevent, and it took this endpoint down
+        # for two days in September 2026 before anyone noticed. The selector
+        # loop's accept simply drops the aborted connection and carries on.
+        asyncio.run(
+            server.run_streamable_http_async(host=HOST, port=PORT),
+            loop_factory=asyncio.SelectorEventLoop,
+        )
 
     thread = threading.Thread(target=run, name="mcp-endpoint", daemon=True)
     thread.start()
@@ -544,11 +556,15 @@ def boot(autostart: bool = True) -> dict[str, Any]:
     adopted = supervise.reconcile(specs)
     started = supervise.autostart_all(specs) if autostart else []
     # Independent of the tray: headless, nothing else would ever notice a crash.
-    monitor.Monitor().start()
+    # It also watches our own port: an endpoint that dies is worth exiting
+    # over, because the Scheduled Task restarts a failed run and a fresh
+    # orchestrator re-adopts the servers, whereas a deaf one lingers until logon.
+    monitor.Monitor(own_port=PORT).start()
     return {"adopted": adopted, "started": started, "managed": len(specs)}
 
 
-_stdout_is_log = False
+def _log_path() -> Any:
+    return paths.logs_dir() / "orchestrator.log"
 
 
 def _setup_output() -> Any:
@@ -561,26 +577,44 @@ def _setup_output() -> Any:
     tool. So everything goes to a file, and the standard streams are pointed at
     it when they do not exist.
     """
-    global _stdout_is_log
-    handle = open(paths.logs_dir() / "orchestrator.log", "a", encoding="utf-8", buffering=1)
+    supervise.rotate_log(_log_path())
+    handle = open(_log_path(), "a", encoding="utf-8", buffering=1)
     if sys.stdout is None:
         sys.stdout = handle
-        _stdout_is_log = True
     if sys.stderr is None:
         sys.stderr = handle
     return handle
+
+
+def _stdout_is_log() -> bool:
+    """Is stdout already the log file?
+
+    Decided from the stream itself rather than a module flag. Run as
+    ``python -m orchestrator.server`` this file is imported twice, once as
+    ``__main__`` and once as ``orchestrator.server`` for the monitor, and a
+    flag set in one copy is invisible to the other -- which is how every
+    notification ended up in the log twice.
+    """
+    stream = sys.stdout
+    if stream is None:
+        return True
+    try:
+        return os.path.samefile(getattr(stream, "name", ""), _log_path())
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 def log(message: str) -> None:
     """Write to the orchestrator's own log, and to the console if there is one."""
     line = f"{datetime.datetime.now().isoformat(timespec='seconds')} {message}"
     try:
-        with open(paths.logs_dir() / "orchestrator.log", "a", encoding="utf-8") as handle:
+        supervise.rotate_log(_log_path())
+        with open(_log_path(), "a", encoding="utf-8") as handle:
             handle.write(line + "\n")
     except OSError:
         pass
     # Skip the echo when stdout *is* the log file, or every line lands twice.
-    if sys.stdout is not None and not _stdout_is_log:
+    if not _stdout_is_log():
         try:
             print(line, flush=True)
         except (ValueError, OSError):

@@ -73,7 +73,17 @@ def main() -> int:
         from orchestrator import restart
 
         marker = restart.pending()
-        if not marker or restart.has_consumed(session_id, marker):
+        if not marker:
+            return 0
+        if restart.expired(marker):
+            restart.clear()  # nobody is waiting for a day-old change
+            return 0
+        if not restart.applies_to(session_id, marker):
+            # Already handled, or this session started after the marker was
+            # dropped and attached the new server set at startup. Record it so
+            # the marker can be retired once every live session is accounted for.
+            restart.mark_consumed(session_id, marker)
+            restart.clear_if_done()
             return 0
 
         pid = os.environ.get("CLAUDE_PID")
@@ -83,6 +93,7 @@ def main() -> int:
         # retrying on every turn from here on.
         restart.mark_consumed(session_id, marker)
         restart.restart_session(session_id, pid=int(pid) if pid else None, cwd=cwd)
+        restart.clear_if_done()
         _emit(
             f"Detecting pending mcp restart ({marker.get('reason')}) - restarting this "
             f"session in a new tab, resuming the same transcript."

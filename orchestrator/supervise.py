@@ -216,7 +216,7 @@ def _note_crash(name: str) -> dict[str, Any]:
         pid=None,
         create_time=None,
         crashed_at=_now(),
-        crashes=int(entry.get("crashes", 0)) + 1,
+        crashes=int(entry.get("crashes") or 0) + 1,
         last_exit={"code": "vanished", "at": _now()},
         last_error=entry.get("last_error") or "process exited on its own",
     )
@@ -267,8 +267,8 @@ def status(spec: ServerSpec) -> dict[str, Any]:
         "started": entry.get("started"),
         "crashed_at": entry.get("crashed_at"),
         "uptime_seconds": None,
-        "starts": entry.get("starts", 0),
-        "crashes": entry.get("crashes", 0),
+        "starts": entry.get("starts") or 0,
+        "crashes": entry.get("crashes") or 0,
         "last_error": entry.get("last_error"),
         "last_exit": entry.get("last_exit"),
         "log": str(paths.log_file(spec.name)),
@@ -292,16 +292,25 @@ def status_all(specs: list[ServerSpec]) -> list[dict[str, Any]]:
 # --- logs ----------------------------------------------------------------
 
 
-def _open_log(name: str) -> Any:
-    """Append-mode log handle, rotating once the file gets unwieldy."""
-    path = paths.log_file(name)
+def rotate_log(path: Path) -> None:
+    """Move ``x.log`` aside as ``x.log.1`` once it gets unwieldy.
+
+    One generation is enough: the point is that a log never grows without
+    bound, not an archive. Rotation is a nicety; it never blocks a start.
+    """
     try:
         if path.exists() and path.stat().st_size > LOG_MAX_BYTES:
             previous = path.with_suffix(".log.1")
             previous.unlink(missing_ok=True)
             path.rename(previous)
     except OSError:
-        pass  # rotation is a nicety; never block a start on it
+        pass
+
+
+def _open_log(name: str) -> Any:
+    """Append-mode log handle, rotating once the file gets unwieldy."""
+    path = paths.log_file(name)
+    rotate_log(path)
     return open(path, "a", encoding="utf-8", errors="replace", buffering=1)
 
 
@@ -386,9 +395,10 @@ def start(spec: ServerSpec, wait: float = START_TIMEOUT) -> dict[str, Any]:
         port=spec.port,
         command=list(spec.command),
         cwd=cwd,
-        starts=int(previous.get("starts", 0)) + 1,
-        crashes=int(previous.get("crashes", 0)),
+        starts=int(previous.get("starts") or 0) + 1,
+        crashes=int(previous.get("crashes") or 0),
         crashed_at=None,
+        stopped_by_user=False,
         last_error=None,
         last_error_at=None,
         last_exit=None,
@@ -409,7 +419,7 @@ def start(spec: ServerSpec, wait: float = START_TIMEOUT) -> dict[str, Any]:
             spec.name,
             last_error=f"{message}; last log line: {detail}",
             last_error_at=_now(),
-            crashes=int(previous.get("crashes", 0)) + (1 if exited is not None else 0),
+            crashes=int(previous.get("crashes") or 0) + (1 if exited is not None else 0),
             last_exit={"code": exited, "at": _now()} if exited is not None else None,
         )
         result = status(spec)
@@ -444,7 +454,7 @@ def stop(spec: ServerSpec, force: bool = False) -> dict[str, Any]:
                 f"{spec.name}: port {spec.port} is held by a process this orchestrator "
                 f"did not start; refusing to kill it"
             )
-        _update_entry(spec.name, pid=None, create_time=None)
+        _update_entry(spec.name, pid=None, create_time=None, stopped_by_user=True)
         return {**status(spec), "was_running": False}
 
     victims = []
@@ -472,6 +482,9 @@ def stop(spec: ServerSpec, force: bool = False) -> dict[str, Any]:
         pid=None,
         create_time=None,
         crashed_at=None,  # a deliberate stop is not a crash, and clears the last one
+        # The monitor restarts a server that is merely down, so it needs to know
+        # this one is down because somebody said so. Cleared again by start().
+        stopped_by_user=True,
         stopped=_now(),
         last_exit={"code": "terminated", "at": _now()},
     )
@@ -488,6 +501,93 @@ def restart(spec: ServerSpec) -> dict[str, Any]:
 
 
 # --- adoption and autostart ---------------------------------------------
+
+
+def _normalise(command: list[str]) -> list[str]:
+    return [str(part).replace("\\", "/").casefold() for part in command]
+
+
+def _command_index() -> dict[tuple[str, ...], list[tuple[int, int | None, psutil.Process]]]:
+    """One sweep of every process, keyed by command line.
+
+    Built once per adoption pass rather than once per server: enumerating a few
+    hundred processes with their command lines is the expensive part, and doing
+    it per spec turned a cheap check into a visible cost every ten seconds.
+    """
+    index: dict[tuple[str, ...], list[tuple[int, int | None, psutil.Process]]] = {}
+    for proc in psutil.process_iter(["pid", "ppid", "cmdline"]):
+        try:
+            cmdline = proc.info.get("cmdline")
+            if not cmdline:
+                continue
+            index.setdefault(tuple(_normalise(cmdline)), []).append(
+                (proc.info["pid"], proc.info.get("ppid"), proc)
+            )
+        except (psutil.NoSuchProcess, psutil.AccessDenied, TypeError):
+            continue
+    return index
+
+
+def find_running(spec: ServerSpec, index: dict | None = None) -> psutil.Process | None:
+    """A process already running this server's exact command, if there is one.
+
+    This is how a server survives losing its runtime record -- an orchestrator
+    that was killed rather than shut down, or a ``running.json`` that got
+    truncated. Without it such a server reads as ``external``, which the monitor
+    deliberately will not touch, so it is unsupervised for as long as it lives
+    and stays dead the moment it falls over.
+
+    The venv launcher re-executes the real interpreter with an identical command
+    line, so a match is normally two processes deep. We want the outermost one,
+    because ``stop`` kills the tree downwards from the pid it recorded.
+    """
+    index = _command_index() if index is None else index
+    found = index.get(tuple(_normalise(spec.command)))
+    if not found:
+        return None
+    pids = {pid for pid, _, _ in found}
+    outermost = [entry for entry in found if entry[1] not in pids]
+    return min(outermost or found, key=lambda entry: entry[0])[2]
+
+
+def adopt_orphans(specs: list[ServerSpec], data: dict[str, dict[str, Any]] | None = None) -> list[str]:
+    """Claim any configured server that is running without us holding its record.
+
+    Runs at startup *and* on every monitor pass, because the record can go
+    missing at any time -- a hand-edited ``running.json``, a torn write, an
+    orchestrator killed rather than shut down. An unclaimed server reads as
+    ``external``, which is never supervised and never restarted, so leaving this
+    to startup alone means a lost record quietly disarms the supervisor until
+    somebody reboots.
+    """
+    save = data is None
+    data = _load_running() if data is None else data
+    unclaimed = [spec for spec in specs if not _live_process(data.get(spec.name, {}))]
+    if not unclaimed:
+        return []  # the healthy case: no process sweep at all
+
+    index = _command_index()
+    claimed: list[str] = []
+    for spec in unclaimed:
+        entry = dict(data.get(spec.name, {}))
+        proc = find_running(spec, index)
+        if proc is None:
+            continue
+        try:
+            entry["create_time"] = proc.create_time()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        entry["pid"] = proc.pid
+        entry["starts"] = int(entry.get("starts") or 0)
+        entry["crashes"] = int(entry.get("crashes") or 0)
+        entry["crashed_at"] = None
+        entry["stopped_by_user"] = False
+        entry["adopted"] = _now()
+        data[spec.name] = entry
+        claimed.append(spec.name)
+    if save and claimed:
+        _save_running(data)
+    return claimed
 
 
 def reconcile(specs: list[ServerSpec]) -> dict[str, Any]:
@@ -512,11 +612,18 @@ def reconcile(specs: list[ServerSpec]) -> dict[str, Any]:
         else:
             entry["pid"] = None
             entry["create_time"] = None
-            entry["crashes"] = int(entry.get("crashes", 0)) + 1
+            entry["crashes"] = int(entry.get("crashes") or 0) + 1
             entry["crashed_at"] = _now()
             entry["last_exit"] = {"code": "vanished", "at": _now()}
             entry["last_error"] = "process was gone when the orchestrator next looked"
             lost.append(name)
+
+    # Anything still running from an earlier orchestrator, whose record we no
+    # longer hold: claim it by command line rather than leaving it unsupervised.
+    for name in adopt_orphans(specs, data):
+        if name not in adopted:
+            adopted.append(name)
+
     _save_running(data)
     return {"adopted": adopted, "lost": lost}
 
