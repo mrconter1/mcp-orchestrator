@@ -292,16 +292,25 @@ def status_all(specs: list[ServerSpec]) -> list[dict[str, Any]]:
 # --- logs ----------------------------------------------------------------
 
 
-def _open_log(name: str) -> Any:
-    """Append-mode log handle, rotating once the file gets unwieldy."""
-    path = paths.log_file(name)
+def rotate_log(path: Path) -> None:
+    """Move ``x.log`` aside as ``x.log.1`` once it gets unwieldy.
+
+    One generation is enough: the point is that a log never grows without
+    bound, not an archive. Rotation is a nicety; it never blocks a start.
+    """
     try:
         if path.exists() and path.stat().st_size > LOG_MAX_BYTES:
             previous = path.with_suffix(".log.1")
             previous.unlink(missing_ok=True)
             path.rename(previous)
     except OSError:
-        pass  # rotation is a nicety; never block a start on it
+        pass
+
+
+def _open_log(name: str) -> Any:
+    """Append-mode log handle, rotating once the file gets unwieldy."""
+    path = paths.log_file(name)
+    rotate_log(path)
     return open(path, "a", encoding="utf-8", errors="replace", buffering=1)
 
 
