@@ -17,6 +17,7 @@ tools here, restart the server *and* the sessions that use it.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any
 
@@ -44,7 +45,14 @@ def __IDENT___ping(message: str = "hello") -> dict[str, Any]:
 
 def main() -> None:
     print(f"__NAME__ mcp listening on http://{HOST}:{PORT}/mcp", flush=True)
-    server.run(transport="streamable-http", host=HOST, port=PORT)
+    # The selector loop, not ``server.run``: on Windows the default Proactor
+    # loop closes its listening socket when a client resets a connection before
+    # the accept completes (WinError 64), leaving a live process that answers
+    # nothing. The selector loop drops the aborted connection and carries on.
+    asyncio.run(
+        server.run_streamable_http_async(host=HOST, port=PORT),
+        loop_factory=asyncio.SelectorEventLoop,
+    )
 
 
 if __name__ == "__main__":
