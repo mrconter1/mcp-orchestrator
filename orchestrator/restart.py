@@ -105,6 +105,58 @@ def has_consumed(session_id: str, marker: dict[str, Any]) -> bool:
     return _consumed().get(session_id) == _marker_key(marker)
 
 
+# A marker nobody has acted on in a day describes a server set that has long
+# since been picked up by every session that matters, or by a reboot.
+MARKER_TTL = datetime.timedelta(hours=24)
+
+
+def expired(marker: dict[str, Any], now: datetime.datetime | None = None) -> bool:
+    """Has the marker outlived any session it could sensibly apply to?"""
+    try:
+        at = datetime.datetime.fromisoformat(str(marker.get("at")))
+    except (TypeError, ValueError):
+        return True  # unreadable timestamp: the marker cannot be trusted either
+    return (now or datetime.datetime.now()) - at > MARKER_TTL
+
+
+def applies_to(session_id: str, marker: dict[str, Any]) -> bool:
+    """Should this session restart for this marker?
+
+    Only a session that was already running when the marker was dropped has a
+    stale server list. One started afterwards attached the new set at startup,
+    and restarting it would be pure churn -- which is exactly what a marker from
+    2026-08-19 did to ninety sessions before this check existed: every new
+    session consumed it at its first Stop hook and was asked to restart.
+    """
+    if has_consumed(session_id, marker):
+        return False
+    entry = registry.get(session_id) or {}
+    started = str(entry.get("started") or "")
+    at = str(marker.get("at") or "")
+    if started and at and started >= at:  # ISO seconds compare as strings
+        return False
+    return True
+
+
+def clear_if_done() -> bool:
+    """Drop the marker once every live session has consumed it.
+
+    Without this the marker and its consumed-list live forever, and every
+    session that starts from then on has to look at, and reason about, a change
+    that finished long ago.
+    """
+    marker = pending()
+    if not marker:
+        return False
+    key = _marker_key(marker)
+    consumed = _consumed()
+    live = registry.list_sessions()
+    if all(consumed.get(s["session_id"]) == key for s in live):
+        clear()
+        return True
+    return False
+
+
 def mark_consumed(session_id: str, marker: dict[str, Any]) -> None:
     """Record that this session has handled this marker.
 
