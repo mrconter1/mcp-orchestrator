@@ -66,7 +66,18 @@ letting a dead one look like a missing tool.
   abandoned with a notification. Two minutes of health clears the count. Down
   means down: `crashed`, `unhealthy`, or simply not running. The one exception
   is a server stopped through `mcp_stop`, which is recorded as deliberate at the
-  moment it is asked for and left alone until it is started again.
+  moment it is asked for and left alone until it is started again. `unhealthy`
+  has to hold for two samples first; one missed 350 ms probe is not a verdict.
+- **The orchestrator watches itself too.** If its own endpoint stops answering
+  for three samples it exits with code 3. The Scheduled Task restarts a failed
+  run, and the replacement re-adopts the servers, which were never touched.
+- **Servers must run on the selector event loop.** Python's default Windows
+  loop, the Proactor, closes its listening socket when a client resets a
+  connection before the accept completes (`WinError 64`), and the process then
+  lives on answering nothing. That single mechanism accounted for every
+  "unhealthy" restart in the first month. The scaffold template and this
+  server use `asyncio.run(..., loop_factory=asyncio.SelectorEventLoop)`; any
+  server added by hand should do the same.
 - **The tray colour is the summary.** Green up, amber starting or stopped, red
   with an exclamation for trouble.
 
@@ -91,7 +102,6 @@ editable), `running.json`, `sessions.json`, the restart markers, and `logs/`.
 
 - The at-logon trigger is configured but has only ever been fired manually.
 - The live session restart path (`wt.exe` plus `--resume`) is unproven.
-- `orchestrator.log` does not rotate; per-server logs rotate at 5 MB.
 - Windows only, throughout.
 
 [DESIGN.md](DESIGN.md) has the reasoning, including why this is a Scheduled
