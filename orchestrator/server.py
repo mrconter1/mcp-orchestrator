@@ -21,6 +21,7 @@ import time
 import traceback
 from typing import Any
 
+import uvicorn
 from mcp.server.mcpserver import MCPServer
 
 from orchestrator import (
@@ -540,10 +541,18 @@ def start_mcp_thread() -> threading.Thread:
         # this whole program exists to prevent, and it took this endpoint down
         # for two days in September 2026 before anyone noticed. The selector
         # loop's accept simply drops the aborted connection and carries on.
-        asyncio.run(
-            server.run_streamable_http_async(host=HOST, port=PORT),
-            loop_factory=asyncio.SelectorEventLoop,
+        # Our own uvicorn.Config rather than ``run_streamable_http_async``, only
+        # to turn the access log off: one line per request was nearly all of a log
+        # the orchestrator can only rotate between restarts. Startup lines and
+        # errors still land in it.
+        config = uvicorn.Config(
+            server.streamable_http_app(host=HOST),
+            host=HOST,
+            port=PORT,
+            log_level=server.settings.log_level.lower(),
+            access_log=False,
         )
+        asyncio.run(uvicorn.Server(config).serve(), loop_factory=asyncio.SelectorEventLoop)
 
     thread = threading.Thread(target=run, name="mcp-endpoint", daemon=True)
     thread.start()
