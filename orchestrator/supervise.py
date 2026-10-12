@@ -45,7 +45,10 @@ SESSION_ENV_MARKERS = (
     "CLAUDECODE",
 )
 
-START_TIMEOUT = 20.0  # seconds to wait for a freshly started port to answer
+# Seconds to wait for a freshly started port to answer. At logon every server
+# starts at once on a machine that is still booting, and queue-mcp has been
+# measured taking 25 s there (2026-10-10), so 20 s raised a false alarm.
+START_TIMEOUT = 45.0
 STOP_TIMEOUT = 8.0
 PROBE_TIMEOUT = 0.35
 LOG_MAX_BYTES = 5 * 1024 * 1024
@@ -243,6 +246,10 @@ def status(spec: ServerSpec) -> dict[str, Any]:
 
     if proc and listening:
         state = "running"
+        if str(entry.get("last_error") or "").startswith("did not open port"):
+            # A slow start, not a broken one: it is serving now, so the alarm
+            # from the start attempt no longer describes anything.
+            entry = _update_entry(spec.name, last_error=None, last_error_at=None)
     elif proc and not listening:
         started_at = entry.get("started_epoch")
         warming = started_at is not None and (time.time() - float(started_at)) < START_TIMEOUT
