@@ -34,6 +34,47 @@ mcp_install("queue")
 expects the ordinary Python layout: a package containing `server.py`, with
 `requirements.txt` beside it.
 
+### Your own servers: `catalogue.json`
+
+Servers in private repositories, or ones that only make sense on your machine,
+go in `~/.mcp-orchestrator/catalogue.json` instead of the built-in list, so this
+public repository never names them. `mcp_catalogue` shows both, and
+`mcp_install("<name>")` works the same for either. A private repo clones with
+whatever git credentials the machine already has.
+
+```json
+{
+  "servers": [
+    {
+      "name": "mail",
+      "repo": "https://github.com/you/mail-mcp",
+      "module": "mail_mcp.server",
+      "port": 8772,
+      "port_env": "MAIL_MCP_PORT",
+      "description": "Outlook mailbox",
+      "setup": ["Copy local.env from an existing install.", "Run .\\login.ps1 once."]
+    }
+  ]
+}
+```
+
+`setup` lists what a clone cannot bring (a browser login, a git-ignored secret);
+`mcp_install` returns it as `next_steps`. A local entry with a built-in's name
+replaces the built-in.
+
+### Keeping servers current: `mcp_update`
+
+```
+mcp_update()            # every managed server
+mcp_update("queue")     # one
+```
+
+Fetches, fast-forwards the checked-out branch to its upstream, reinstalls
+`requirements.txt` and restarts the server, only when new commits came in. A
+checkout with uncommitted changes, unpushed commits or no upstream is reported
+and left alone: that is somebody's work in progress. Sessions keep the tools
+they started with, so follow with `sessions_restart_pending` when tools changed.
+
 ## Tools
 
 | Tool | Purpose |
@@ -41,6 +82,7 @@ expects the ordinary Python layout: a package containing `server.py`, with
 | `mcp_list` / `mcp_status` / `mcp_stats` | what is running, and how it has behaved |
 | `mcp_start` / `mcp_stop` / `mcp_restart` | lifecycle |
 | `mcp_catalogue` / `mcp_install` / `mcp_uninstall` | install and remove servers |
+| `mcp_update` | fetch and fast-forward managed servers, reinstall, restart |
 | `mcp_scaffold` | write a new server from a template |
 | `mcp_add` / `mcp_remove` | manage a server already on disk |
 | `mcp_autostart` / `mcp_enable` | start at logon, or park a server |

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import subprocess
 import datetime
 import os
 import sys
@@ -341,9 +342,10 @@ def mcp_catalogue() -> dict[str, Any]:
     return _ok(
         servers=[
             {**entry, "installed": entry["name"] in managed}
-            for entry in catalogue.CATALOGUE
+            for entry in catalogue.entries()
         ],
-        count=len(catalogue.CATALOGUE),
+        count=len(catalogue.entries()),
+        local_catalogue=str(catalogue.local_file()),
         note="Install with mcp_install('<name>'), or mcp_install('<git url>').",
     )
 
@@ -384,6 +386,30 @@ def mcp_install(
     if register and "error" not in result.get("registration", {}):
         result.update(_finish_install(f"installed MCP server {result['name']!r}", restart_sessions))
     return _ok(**result)
+
+
+@server.tool()
+def mcp_update(name: str | None = None, restart: bool = True) -> dict[str, Any]:
+    """Update managed servers from their git upstream: fetch, fast-forward, reinstall, restart.
+
+    name=None updates every managed server that is a git checkout. Fast-forward
+    only: a checkout with uncommitted changes, unpushed commits or no upstream
+    is reported and left alone. A server is restarted only when new commits
+    came in. Sessions keep the tool list they started with, so call
+    sessions_restart_pending afterwards if a server's tools changed.
+    """
+    names = [name] if name else [spec.name for spec in config.load()]
+    results = []
+    for each in names:
+        try:
+            results.append(catalogue.update(each, restart))
+        except (catalogue.InstallError, OSError, subprocess.TimeoutExpired) as exc:
+            results.append({"name": each, "updated": False, "error": str(exc)})
+    return _ok(
+        servers=results,
+        updated=[r["name"] for r in results if r.get("updated")],
+        refused=[r["name"] for r in results if r.get("error")],
+    )
 
 
 @server.tool()
