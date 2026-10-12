@@ -56,8 +56,31 @@ class InstallError(Exception):
     """Raised when a server cannot be installed as asked."""
 
 
+def local_file() -> Path:
+    return paths.home() / "catalogue.json"
+
+
+def entries() -> list[dict[str, Any]]:
+    """The built-in catalogue plus the user's own ``catalogue.json``.
+
+    This repository is public, so servers that live in private repositories,
+    or that only make sense on one machine, belong in the local file rather
+    than in the list above. Same fields as ``CATALOGUE``, plus an optional
+    ``setup`` list of steps the install cannot do itself (a browser login, a
+    secret to put in place). A local entry with a built-in's name replaces it.
+    """
+    local = paths.read_json(local_file(), [])
+    if isinstance(local, dict):
+        local = local.get("servers", [])
+    merged = {entry["name"]: {**entry, "source": "built-in"} for entry in CATALOGUE}
+    for entry in local if isinstance(local, list) else []:
+        if isinstance(entry, dict) and entry.get("name") and entry.get("repo"):
+            merged[entry["name"]] = {**entry, "source": "local"}
+    return list(merged.values())
+
+
 def find(name: str) -> dict[str, Any] | None:
-    for entry in CATALOGUE:
+    for entry in entries():
         if entry["name"] == name:
             return entry
     return None
@@ -243,7 +266,7 @@ def install(
         url = name_or_url
         name = name or _repo_name(url).replace("-mcp", "").replace("_", "-")
     else:
-        known = ", ".join(e["name"] for e in CATALOGUE)
+        known = ", ".join(e["name"] for e in entries())
         raise InstallError(
             f"{name_or_url!r} is not in the catalogue and is not a repository. "
             f"Known: {known}"
@@ -306,7 +329,7 @@ def install(
         except claude_cli.ClaudeCliError as exc:
             steps["registration"] = {"error": str(exc)}
 
-    return {
+    result = {
         "name": name,
         "module": module,
         "directory": str(target),
@@ -315,3 +338,82 @@ def install(
         "logs": str(paths.log_file(name)),
         **steps,
     }
+    if entry and entry.get("setup"):
+        # What the clone cannot bring: a login, a git-ignored secret. Without
+        # these the server starts and then fails on its first real call.
+        result["next_steps"] = entry["setup"]
+    return result
+
+
+def _git(directory: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(  # noqa: S603
+        ["git", "-C", str(directory), *args],
+        capture_output=True, text=True, timeout=CLONE_TIMEOUT, check=False,
+    )
+
+
+def update(name: str, restart: bool = True) -> dict[str, Any]:
+    """Bring a managed server's checkout up to date with its upstream branch.
+
+    Fast-forward only. A checkout with uncommitted changes, commits that are
+    not upstream, or no upstream at all is somebody's work in progress, and is
+    refused rather than touched. Requirements are reinstalled and the server
+    restarted only when something actually came in.
+    """
+    spec = config.get(name)
+    if spec is None:
+        raise InstallError(f"no server named {name!r} is managed")
+    if not spec.cwd or not (Path(spec.cwd) / ".git").exists():
+        raise InstallError(f"{name}: {spec.cwd} is not a git checkout")
+    directory = Path(spec.cwd)
+
+    branch = _git(directory, "branch", "--show-current").stdout.strip()
+    upstream = _git(directory, "rev-parse", "--abbrev-ref", "@{u}")
+    if not branch or upstream.returncode != 0:
+        raise InstallError(f"{name}: branch {branch or '(detached)'} has no upstream to update from")
+    if _git(directory, "status", "--porcelain").stdout.strip():
+        raise InstallError(f"{name}: uncommitted changes in {directory}; commit or discard them first")
+
+    fetched = _git(directory, "fetch", "--quiet", "origin")
+    if fetched.returncode != 0:
+        raise InstallError(f"{name}: git fetch failed: {(fetched.stderr or fetched.stdout).strip()}")
+    local_only = _git(directory, "rev-list", "--count", "@{u}..HEAD").stdout.strip()
+    if local_only not in ("", "0"):
+        raise InstallError(
+            f"{name}: {local_only} local commit(s) on {branch} are not on "
+            f"{upstream.stdout.strip()}; push them or rebuild the branch first"
+        )
+
+    incoming = _git(directory, "log", "--oneline", "HEAD..@{u}").stdout.strip().splitlines()
+    result: dict[str, Any] = {
+        "name": name,
+        "branch": branch,
+        "upstream": upstream.stdout.strip(),
+        "before": _git(directory, "rev-parse", "--short", "HEAD").stdout.strip(),
+        "incoming": incoming,
+    }
+    if not incoming:
+        return {**result, "updated": False}
+
+    moved = _git(directory, "merge", "--ff-only", "--quiet", "@{u}")
+    if moved.returncode != 0:
+        raise InstallError(f"{name}: fast-forward failed: {(moved.stderr or moved.stdout).strip()}")
+    result["after"] = _git(directory, "rev-parse", "--short", "HEAD").stdout.strip()
+    result["updated"] = True
+
+    python = Path(spec.command[0]) if spec.command else None
+    if python and python.exists() and (directory / "requirements.txt").exists():
+        pip = subprocess.run(  # noqa: S603
+            [str(python), "-m", "pip", "install", "--quiet", "-r", str(directory / "requirements.txt")],
+            capture_output=True, text=True, timeout=scaffold.PIP_TIMEOUT, check=False,
+        )
+        result["requirements"] = (
+            "installed" if pip.returncode == 0 else (pip.stderr or pip.stdout).strip()[-500:]
+        )
+
+    if restart and supervise.status(spec)["state"] in ("running", "starting", "unhealthy"):
+        try:
+            result["restart"] = supervise.restart(spec)["state"]
+        except supervise.SuperviseError as exc:
+            result["restart"] = f"error: {exc}"
+    return result
