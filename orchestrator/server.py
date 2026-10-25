@@ -30,6 +30,7 @@ from orchestrator import (
     catalogue,
     claude_cli,
     config,
+    guard,
     monitor,
     paths,
     registry,
@@ -546,9 +547,17 @@ def orchestrator_info() -> dict[str, Any]:
         config_file=str(paths.config_file()),
         logs_dir=str(paths.logs_dir()),
         managed=len(specs),
+        readonly=guard.readonly(),
+        token_required=guard.token_file() is not None,
         running=sum(1 for s in states if s["state"] == "running"),
         unhealthy=[s["name"] for s in states if s["state"] in ("crashed", "unhealthy")],
     )
+
+
+# A bundled install can drop the tools that change which command lines run.
+if guard.readonly():
+    for _name in guard.MUTATING_TOOLS:
+        server.remove_tool(_name)
 
 
 def start_mcp_thread() -> threading.Thread:
@@ -572,7 +581,7 @@ def start_mcp_thread() -> threading.Thread:
         # the orchestrator can only rotate between restarts. Startup lines and
         # errors still land in it.
         config = uvicorn.Config(
-            server.streamable_http_app(host=HOST),
+            guard.wrap(server.streamable_http_app(host=HOST)),
             host=HOST,
             port=PORT,
             log_level=server.settings.log_level.lower(),
