@@ -134,6 +134,15 @@ The restart is decentralised. A change drops a marker, and each session's Stop
 hook acts on it at the end of a turn, when nothing is in flight, resuming the
 same transcript so history and queue survive.
 
+## Locking it down (bundled installs)
+
+The orchestrator can run any command line it is told to (`mcp_add`, `mcp_install`, `mcp_scaffold`, `mcp_update`). 127.0.0.1 keeps other machines out and the SDK's Host check keeps web pages out, but another program or another Windows user on the same machine can still reach the port. Two switches, both off by default:
+
+- `MCP_ORCHESTRATOR_TOKEN_FILE=<path>`: every `/mcp` request needs `Authorization: Bearer <token>`. The token is kept DPAPI-protected in that file and made on first start. A file that exists but cannot be read locks the endpoint (503) rather than opening it.
+- `MCP_ORCHESTRATOR_READONLY=1`: the add/remove/scaffold/install/update/uninstall tools are not registered. Start, stop, restart, logs and status still work.
+
+An installer that ships its own fixed server set should turn both on.
+
 ## Files
 
 State lives in `~/.mcp-orchestrator`, outside this repo, because the hooks must
